@@ -1,6 +1,6 @@
 # Debian Security Hardening Suite
 
-A comprehensive collection of security hardening scripts and configurations for Debian-based Linux distributions.
+A collection of security hardening scripts and configurations for Debian-based Linux distributions.
 
 ## 🛡️ Overview
 
