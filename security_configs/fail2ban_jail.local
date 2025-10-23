@@ -1,0 +1,116 @@
+# Fail2ban Configuration for Enhanced Security
+# This configuration provides comprehensive protection against brute force attacks
+
+[DEFAULT]
+# Ban time in seconds (1 hour)
+bantime = 3600
+
+# Time window in seconds (10 minutes)
+findtime = 600
+
+# Maximum number of failures before ban
+maxretry = 3
+
+# Ignore IPs (add your trusted IPs here)
+ignoreip = 127.0.0.1/8 ::1
+
+# Email notifications (configure if you want email alerts)
+# destemail = admin@yourdomain.com
+# sender = fail2ban@yourdomain.com
+# action = %(action_mwl)s
+
+[sshd]
+enabled = true
+port = ssh
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+findtime = 600
+
+[apache-auth]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*error.log
+
+[apache-badbots]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*access.log
+bantime = 172800
+maxretry = 1
+
+[apache-noscript]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*access.log
+
+[apache-overflows]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*error.log
+maxretry = 2
+
+[apache-nohome]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*access.log
+maxretry = 2
+
+[apache-botsearch]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*access.log
+maxretry = 2
+
+[apache-fakegooglebot]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*access.log
+maxretry = 1
+
+[apache-modsecurity]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*modsec_audit.log
+maxretry = 2
+
+[apache-shellshock]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*error.log
+maxretry = 1
+
+[php-url-fopen]
+enabled = false
+port = http,https
+logpath = /var/log/apache2/*access.log
+
+[nginx-http-auth]
+enabled = false
+port = http,https
+logpath = /var/log/nginx/error.log
+
+[nginx-limit-req]
+enabled = false
+port = http,https
+logpath = /var/log/nginx/error.log
+
+[nginx-botsearch]
+enabled = false
+port = http,https
+logpath = /var/log/nginx/access.log
+
+[nginx-http-auth]
+enabled = false
+port = http,https
+logpath = /var/log/nginx/error.log
+
+[nginx-limit-req]
+enabled = false
+port = http,https
+logpath = /var/log/nginx/error.log
+
+[nginx-botsearch]
+enabled = false
+port = http,https
+logpath = /var/log/nginx/access.log
