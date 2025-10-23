@@ -1,0 +1,333 @@
+# ===========================================
+# SENSITIVE INFORMATION & SECURITY
+# ===========================================
+
+# API Keys and Tokens
+*.key
+*.pem
+*.p12
+*.pfx
+api_key.txt
+api_keys.txt
+secrets.txt
+tokens.txt
+.env
+.env.local
+.env.production
+.env.staging
+.env.development
+.env.test
+.env.*.local
+
+# Database credentials
+database.ini
+db_config.json
+db_credentials.yaml
+db_credentials.yml
+db_secrets.json
+
+# SSH Keys
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.pem
+ssh_keys/
+.ssh/
+
+# Certificates and Keys
+*.crt
+*.cer
+*.der
+*.p7b
+*.p7c
+*.p12
+*.pfx
+*.jks
+*.keystore
+certificates/
+certs/
+
+# ===========================================
+# CONFIGURATION FILES WITH SENSITIVE DATA
+# ===========================================
+
+# Configuration files that might contain secrets
+config.json
+config.yaml
+config.yml
+settings.json
+secrets.json
+credentials.json
+auth.json
+*.conf
+*.config
+
+# Database connection strings
+connection_strings.txt
+db_connections.json
+
+# Email credentials
+smtp_config.json
+email_credentials.json
+mail_config.json
+
+# Cloud provider credentials
+aws_credentials.json
+azure_credentials.json
+gcp_credentials.json
+cloud_credentials.json
+
+# ===========================================
+# DEVELOPMENT & BUILD ARTIFACTS
+# ===========================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+.pnp
+.pnp.js
+
+# React/Next.js
+.next/
+out/
+build/
+dist/
+
+# ===========================================
+# OPERATING SYSTEM FILES
+# ===========================================
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ===========================================
+# IDE & EDITOR FILES
+# ===========================================
+
+# Visual Studio Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ===========================================
+# LOGS & TEMPORARY FILES
+# ===========================================
+
+# Log files
+*.log
+logs/
+log/
+*.log.*
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+.tmp/
+.temp/
+
+# Cache files
+*.cache
+.cache/
+cache/
+
+# ===========================================
+# DATABASE FILES
+# ===========================================
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# MySQL
+*.sql
+*.dump
+
+# PostgreSQL
+*.backup
+*.sql
+
+# ===========================================
+# BACKUP FILES
+# ===========================================
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+backup/
+backups/
+
+# ===========================================
+# SECURITY & PRIVACY
+# ===========================================
+
+# Personal information
+personal_data/
+user_data/
+private/
+confidential/
+
+# Security scans
+security_scan_results/
+vulnerability_reports/
+
+# ===========================================
+# PROJECT SPECIFIC
+# ===========================================
+
+# Trading bot specific
+trading_logs/
+profit_loss/
+trading_data/
+market_data/
+
+# Database migration specific
+migration_backups/
+db_backups/
+
+# System monitoring specific
+monitoring_data/
+system_logs/
+performance_data/
+
+# ===========================================
+# CLOUD & DEPLOYMENT
+# ===========================================
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Kubernetes
+*.kubeconfig
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# ===========================================
+# TESTING
+# ===========================================
+
+# Test results
+test_results/
+coverage/
+.coverage
+.pytest_cache/
+htmlcov/
+
+# ===========================================
+# MISC
+# ===========================================
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Large files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+
+# Documentation drafts
+draft/
+drafts/
+*.draft
