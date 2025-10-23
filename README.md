@@ -242,3 +242,4 @@ Feel free to submit issues, feature requests, or pull requests to improve these 
 ## 📄 License
 
 This project is provided as-is for educational and security purposes. Use at your own risk.
+Feel free to adopt, change and modify as fit
