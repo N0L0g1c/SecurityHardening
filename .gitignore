@@ -60,8 +60,11 @@ settings.json
 secrets.json
 credentials.json
 auth.json
-*.conf
 *.config
+# Ignore ad-hoc confs, but keep suite security configs tracked
+*.conf
+!security_configs/*.conf
+!security_configs/*.local
 
 # Database connection strings
 connection_strings.txt
@@ -94,7 +97,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# Do not ignore suite helpers in ./lib (Python egg "lib/" is rare here)
 lib64/
 parts/
 sdist/

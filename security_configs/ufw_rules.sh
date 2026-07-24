@@ -1,46 +1,32 @@
 #!/bin/bash
-# UFW Firewall Rules Configuration
-# This script sets up comprehensive firewall rules for a Debian server
+# UFW Firewall Rules — Debian/Ubuntu
+# Respects SSH_PORT env (set by suite) so custom SSH ports stay reachable.
 
-# Reset UFW to default state
+set -euo pipefail
+
+SSH_PORT="${SSH_PORT:-22}"
+if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]] || ((SSH_PORT < 1 || SSH_PORT > 65535)); then
+  echo "Invalid SSH_PORT='$SSH_PORT'; defaulting to 22" >&2
+  SSH_PORT=22
+fi
+
 ufw --force reset
-
-# Set default policies
 ufw default deny incoming
 ufw default allow outgoing
 
-# Allow essential services
-ufw allow ssh
-ufw allow 80/tcp    # HTTP
-ufw allow 443/tcp   # HTTPS
+# Rate-limit SSH on the active port
+ufw limit "${SSH_PORT}/tcp" comment 'SSH'
 
-# Allow specific ports for common services (uncomment as needed)
-# ufw allow 21/tcp    # FTP
-# ufw allow 22/tcp    # SSH (already allowed above)
-# ufw allow 25/tcp    # SMTP
-# ufw allow 53/tcp    # DNS
-# ufw allow 53/udp    # DNS
-# ufw allow 110/tcp   # POP3
-# ufw allow 143/tcp   # IMAP
-# ufw allow 993/tcp   # IMAPS
-# ufw allow 995/tcp   # POP3S
-# ufw allow 587/tcp   # SMTP submission
-# ufw allow 993/tcp   # IMAPS
-# ufw allow 995/tcp   # POP3S
+ufw allow 80/tcp comment 'HTTP'
+ufw allow 443/tcp comment 'HTTPS'
 
-# Allow specific IP ranges (customize as needed)
-# ufw allow from 192.168.1.0/24
-# ufw allow from 10.0.0.0/8
+# Optional services (uncomment as needed)
+# ufw allow 25/tcp comment 'SMTP'
+# ufw allow 587/tcp comment 'SMTP submission'
+# ufw allow from 192.168.0.0/16
 
-# Rate limiting for SSH (optional)
-# ufw limit ssh
-
-# Enable logging
 ufw logging on
-
-# Enable UFW
 ufw --force enable
 
-echo "UFW firewall rules configured successfully!"
-echo "Current status:"
+echo "UFW configured (SSH ${SSH_PORT}/tcp rate-limited)."
 ufw status verbose

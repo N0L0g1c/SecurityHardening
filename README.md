@@ -1,244 +1,107 @@
-# Debian Security Hardening Suite
+# Security Hardening Suite (Debian & Ubuntu)
 
-A collection of security hardening scripts and configurations for Debian-based Linux distributions.
+Automated security hardening for **Debian** and **Ubuntu**. One installer, three levels, shared helpers that skip missing packages and avoid SSH lockouts.
 
-## 🛡️ Overview
+## Quick start
 
-This suite provides multiple levels of security hardening for Debian systems, from quick basic setup to comprehensive enterprise-grade security configurations.
-
-## 📁 Contents
-
-### Scripts
-
-- **`advanced_security.sh`** - Security hardening with advanced features
-- **`secure_debian.sh`** - Standard security hardening script
-- **`quick_secure.sh`** - Quick basic security setup
-
-### Configuration Files
-
-- **`security_configs/ssh_hardening.conf`** - SSH security configuration
-- **`security_configs/fail2ban_jail.local`** - Fail2ban intrusion prevention rules
-- **`security_configs/ufw_rules.sh`** - UFW firewall configuration
-
-## 🚀 Quick Start
-
-### 1. Basic Security (Recommended for beginners)
 ```bash
-cd security_hardening
-chmod +x quick_secure.sh
+cd SecurityHardening
+chmod +x install.sh
+sudo ./install.sh                  # interactive menu
+sudo ./install.sh --level quick -y # fully automated
+sudo ./install.sh --level standard -y
+sudo ./install.sh --level advanced -y
+sudo SKIP_APT_UPGRADE=1 ./install.sh --level standard -y  # re-run without full upgrade
+```
+
+Or run a level script directly:
+
+```bash
 sudo ./quick_secure.sh
-```
-
-### 2. Standard Security (Recommended for most users)
-```bash
-cd security_hardening
-chmod +x secure_debian.sh
 sudo ./secure_debian.sh
-```
-
-### 3. Advanced Security (Enterprise/Production)
-```bash
-cd security_hardening
-chmod +x advanced_security.sh
 sudo ./advanced_security.sh
 ```
 
-## 🔧 Features Comparison
+## What works on Debian vs Ubuntu
+
+| Concern | Behavior |
+|---------|----------|
+| Distro check | Refuses non-Debian-family systems |
+| Packages | Installs only packages available in your repos (e.g. skips `libpam-cracklib` on modern Ubuntu) |
+| Unattended upgrades | Ubuntu security/ESM origins vs Debian-Security origins |
+| SSH service | Restarts `ssh` or `sshd` after `sshd -t` validation |
+| SSH config | Drop-in under `/etc/ssh/sshd_config.d/` (does not wipe vendor config) |
+| Firewall | Detects current SSH port before enabling UFW rate-limit |
+| Sysctl | Writes `/etc/sysctl.d/99-security-hardening.conf`; skips unknown keys |
+| Non-interactive | `DEBIAN_FRONTEND=noninteractive` + safe `apt-get` options |
+
+## Feature levels
 
 | Feature | Quick | Standard | Advanced |
 |---------|-------|----------|----------|
-| System Updates | ✅ | ✅ | ✅ |
-| UFW Firewall | ✅ | ✅ | ✅ |
-| Fail2ban | ✅ | ✅ | ✅ |
-| SSH Hardening | ✅ | ✅ | ✅ |
-| Password Policy | ❌ | ✅ | ✅ |
-| Kernel Hardening | ❌ | ✅ | ✅ |
-| AppArmor | ❌ | ✅ | ✅ |
-| File Integrity (AIDE) | ❌ | ✅ | ✅ |
-| Antivirus (ClamAV) | ❌ | ❌ | ✅ |
-| Advanced Monitoring | ❌ | ❌ | ✅ |
-| Vulnerability Scanning | ❌ | ❌ | ✅ |
-| Log Analysis | ❌ | ❌ | ✅ |
+| System updates | yes | yes | yes |
+| UFW + Fail2ban | yes | yes | yes |
+| SSH hardening | yes | yes | yes |
+| Auto security updates | yes | yes | yes |
+| Password policy | — | yes | yes (stricter) |
+| Kernel sysctl | — | yes | yes |
+| AppArmor + auditd | — | yes | yes |
+| AIDE integrity DB | — | yes | yes |
+| ClamAV | — | — | yes |
+| Optional IDS (psad/portsentry) | — | — | if packaged |
+| Lynis / extended monitor | — | — | yes |
 
-## 📋 Prerequisites
+## Layout
 
-- Debian-based Linux distribution (Ubuntu, Debian, etc.)
-- Root/sudo access
-- Internet connection
-- At least 2GB RAM (for advanced features)
+```
+install.sh                 # orchestrator (--level, --yes)
+quick_secure.sh
+secure_debian.sh           # standard level
+advanced_security.sh
+lib/common.sh              # shared detection & hardening helpers
+security_configs/
+  ssh_hardening.conf
+  fail2ban_jail.local
+  ufw_rules.sh
+```
 
-## 🔍 What Each Script Does
+## Prerequisites
 
-### Quick Security (`quick_secure.sh`)
-- Updates system packages
-- Installs essential security packages (UFW, Fail2ban)
-- Configures basic firewall rules
-- Hardens SSH configuration
-- Sets up automatic security updates
+- Debian or Ubuntu (or close derivative with `ID_LIKE=debian`)
+- Root via `sudo`
+- Network for `apt`
+- Console access recommended the first time you harden SSH
 
-**Time to complete:** ~5-10 minutes
-
-### Standard Security (`secure_debian.sh`)
-- All quick security features
-- Advanced password policy enforcement
-- Kernel security parameter hardening
-- AppArmor configuration
-- File integrity monitoring with AIDE
-- Comprehensive logging and monitoring
-- Security status reporting
-
-**Time to complete:** ~15-20 minutes
-
-### Advanced Security (`advanced_security.sh`)
-- All standard security features
-- ClamAV antivirus installation and configuration
-- Advanced intrusion detection (PSAD, PortSentry)
-- Vulnerability scanning with Lynis
-- Malware scanning capabilities
-- Advanced system monitoring
-- Comprehensive security reporting
-- Network security hardening
-
-**Time to complete:** ~30-45 minutes
-
-## 🛠️ Configuration Files
-
-### SSH Hardening (`security_configs/ssh_hardening.conf`)
-- Disables root login
-- Enforces key-based authentication
-- Limits authentication attempts
-- Configures secure protocols
-- Sets connection timeouts
-
-### Fail2ban Configuration (`security_configs/fail2ban_jail.local`)
-- SSH brute force protection
-- Web server protection (Apache/Nginx)
-- Customizable ban times and retry limits
-- Email notifications (configurable)
-- IP whitelist support
-
-### UFW Rules (`security_configs/ufw_rules.sh`)
-- Deny-by-default policy
-- Essential service ports only
-- Rate limiting for SSH
-- Logging configuration
-- Custom IP range support
-
-## 📊 Monitoring and Maintenance
-
-### Security Monitoring
-After running any script, you can monitor security status:
+## After install
 
 ```bash
-# Run security monitor (if using advanced script)
-/usr/local/bin/security-monitor.sh
-
-# Check security logs
+/usr/local/bin/security-check.sh      # quick/standard
+/usr/local/bin/security-monitor.sh    # advanced
+ufw status verbose
+fail2ban-client status
 tail -f /var/log/security-hardening.log
-
-# View daily security reports
 ls /var/log/security-report-*.log
 ```
 
-### Regular Maintenance
-- **Daily**: Check security reports
-- **Weekly**: Run malware scans
-- **Monthly**: Review failed login attempts
-- **Quarterly**: Update security policies
+Config backups land in `/etc/security/backups/`.
 
-## 🔒 Security Features Explained
+## Safety notes
 
-### Firewall (UFW)
-- Blocks all incoming connections by default
-- Allows only essential services (SSH, HTTP, HTTPS)
-- Configurable port rules
-- Rate limiting for SSH connections
+- Keep an open session until you confirm SSH still works from another client.
+- Scripts never set empty `AllowUsers` (that would lock everyone out).
+- Obsolete OpenSSH keys (`UsePrivilegeSeparation`, `RSAAuthentication`, etc.) are not used.
+- Always test on a non-production host first.
 
-### Intrusion Prevention (Fail2ban)
-- Monitors log files for suspicious activity
-- Automatically bans IPs with multiple failed attempts
-- Configurable ban times and retry limits
-- Supports multiple services (SSH, Apache, Nginx)
+## Troubleshooting
 
-### SSH Hardening
-- Disables root login
-- Enforces strong authentication
-- Limits connection attempts
-- Configures secure protocols only
-- Sets appropriate timeouts
+| Issue | Fix |
+|-------|-----|
+| Permission denied | `sudo ./install.sh ...` |
+| UFW blocks you | From console: `ufw allow <ssh-port>/tcp` or `ufw disable` |
+| SSH won't start | `sshd -t` and check `/etc/ssh/sshd_config.d/99-security-hardening.conf` |
+| Package skipped | Normal if not in your release repos; check the log warning |
+| fail2ban / auth.log | Suite defaults to `backend = systemd` |
 
-### Password Policy
-- Minimum 12-14 character passwords
-- Requires multiple character types
-- Prevents dictionary words
-- Enforces password history
+## License
 
-### Kernel Hardening
-- Disables dangerous network features
-- Enables memory protection
-- Restricts kernel information access
-- Configures secure networking parameters
-
-### File Integrity Monitoring (AIDE)
-- Creates database of file checksums
-- Detects unauthorized file changes
-- Monitors critical system files
-- Generates integrity reports
-
-### Antivirus (ClamAV)
-- Real-time malware scanning
-- Regular signature updates
-- Scheduled system scans
-- Quarantine capabilities
-
-## 🚨 Troubleshooting
-
-### Common Issues
-
-1. **Script fails with permission errors**
-   - Ensure you're running as root: `sudo ./script_name.sh`
-
-2. **UFW blocks your connection**
-   - Check UFW status: `ufw status`
-   - Temporarily disable: `ufw disable`
-   - Reconfigure and re-enable
-
-3. **SSH connection refused after hardening**
-   - Check SSH config: `sshd -T`
-   - Restart SSH: `systemctl restart sshd`
-   - Check logs: `journalctl -u ssh`
-
-4. **Fail2ban bans legitimate IPs**
-   - Check fail2ban status: `fail2ban-client status`
-   - Unban IP: `fail2ban-client set sshd unbanip IP_ADDRESS`
-   - Adjust jail configuration
-
-### Log Locations
-- Security hardening: `/var/log/security-hardening.log`
-- Daily reports: `/var/log/security-report-*.log`
-- System logs: `/var/log/syslog`
-- Auth logs: `/var/log/auth.log`
-- Fail2ban: `/var/log/fail2ban.log`
-
-## 📚 Additional Resources
-
-- [Debian Security Documentation](https://www.debian.org/security/)
-- [UFW Documentation](https://help.ubuntu.com/community/UFW)
-- [Fail2ban Documentation](https://www.fail2ban.org/wiki/)
-- [SSH Hardening Guide](https://infosec.mozilla.org/guidelines/openssh)
-
-## ⚠️ Important Notes
-
-- **Always test in a non-production environment first**
-- **Backup your system before running security scripts**
-- **Ensure you have console access in case of SSH issues**
-- **Review and customize configurations for your specific needs**
-- **Regular updates are essential for maintaining security**
-
-## 🤝 Contributing
-
-Feel free to submit issues, feature requests, or pull requests to improve these security scripts.
-
-## 📄 License
-
-This project is provided as-is for educational and security purposes. Use at your own risk.
+Provided as-is for educational and operational security use. Use at your own risk.
