@@ -51,6 +51,31 @@ DISTRO_VERSION=""
 DISTRO_CODENAME=""
 IS_DEBIAN=0
 IS_UBUNTU=0
+UBUNTU_GE_24=0
+UBUNTU_GE_26=0
+SSH_SOCKET_ACTIVATION=0
+
+# True if $1 is greater than or equal to $2 (26.04, 26.10, 28.04, …)
+version_ge() {
+  local ver="$1" min="$2"
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --compare-versions "$ver" ge "$min"
+    return $?
+  fi
+  local lowest
+  lowest="$(printf '%s\n%s\n' "$min" "$ver" | sort -V | tail -n1)"
+  # If ver is the highest (or equal), ge is true when lowest==min OR ver==min handled by: highest==ver
+  [[ "$lowest" == "$ver" ]]
+}
+
+detect_ssh_socket_activation() {
+  SSH_SOCKET_ACTIVATION=0
+  if [[ -f /usr/lib/systemd/system/ssh.socket ]] \
+    || [[ -f /lib/systemd/system/ssh.socket ]] \
+    || systemctl list-unit-files ssh.socket 2>/dev/null | grep -q '^ssh\.socket'; then
+    SSH_SOCKET_ACTIVATION=1
+  fi
+}
 
 detect_os() {
   if [[ ! -f /etc/os-release ]]; then
@@ -70,7 +95,9 @@ detect_os() {
     *)
       if [[ "$DISTRO_LIKE" == *debian* ]] || [[ "$DISTRO_LIKE" == *ubuntu* ]]; then
         IS_DEBIAN=1
-        [[ "$DISTRO_LIKE" == *ubuntu* || "$DISTRO_ID" == *ubuntu* ]] && IS_UBUNTU=1
+        if [[ "$DISTRO_LIKE" == *ubuntu* || "$DISTRO_ID" == *ubuntu* ]]; then
+          IS_UBUNTU=1
+        fi
       else
         error "This suite supports Debian and Ubuntu only (detected: ${DISTRO_ID})"
         exit 1
@@ -78,11 +105,56 @@ detect_os() {
       ;;
   esac
 
+  if [[ "$IS_UBUNTU" -eq 1 && -n "$DISTRO_VERSION" ]]; then
+    if version_ge "$DISTRO_VERSION" "24.04"; then UBUNTU_GE_24=1; fi
+    if version_ge "$DISTRO_VERSION" "26.04"; then UBUNTU_GE_26=1; fi
+  fi
+
+  detect_ssh_socket_activation
+
   info "Detected: ${PRETTY_NAME:-$DISTRO_ID $DISTRO_VERSION}"
+  if [[ "$IS_UBUNTU" -eq 1 ]]; then
+    if [[ "$UBUNTU_GE_26" -eq 1 ]]; then
+      info "Ubuntu ${DISTRO_VERSION} (≥ 26.04): socket SSH, deb822 apt, full-upgrade path enabled"
+    elif [[ "$UBUNTU_GE_24" -eq 1 ]]; then
+      info "Ubuntu ${DISTRO_VERSION}: modern path (socket SSH when present)"
+    fi
+  fi
+  if [[ "$SSH_SOCKET_ACTIVATION" -eq 1 ]]; then
+    info "SSH socket activation detected (ssh.socket)"
+  fi
+  return 0
 }
 
 # --- Apt helpers ---
+# Ensure universe/multiverse on Ubuntu 24+/26+ deb822 sources (needed for some hardening pkgs)
+ensure_ubuntu_components() {
+  [[ "$IS_UBUNTU" -eq 1 ]] || return 0
+  local src="/etc/apt/sources.list.d/ubuntu.sources"
+  [[ -f "$src" ]] || return 0
+
+  if grep -qE '^Components:.*\buniverse\b' "$src" \
+    && grep -qE '^Components:.*\bmultiverse\b' "$src"; then
+    return 0
+  fi
+
+  log "Enabling universe/multiverse in ${src}..."
+  backup_file "$src"
+  # Append missing components on each Components: line (DEB822 / Ubuntu 24+)
+  awk '
+    /^Components:/ {
+      line=$0
+      if (line !~ /(^| )universe( |$)/) line=line " universe"
+      if (line !~ /(^| )multiverse( |$)/) line=line " multiverse"
+      print line
+      next
+    }
+    { print }
+  ' "$src" > "${src}.tmp" && mv "${src}.tmp" "$src"
+}
+
 apt_update() {
+  ensure_ubuntu_components
   log "Updating package lists..."
   apt-get update -qq
 }
@@ -92,8 +164,14 @@ apt_upgrade() {
     info "Skipping apt upgrade (SKIP_APT_UPGRADE=1)"
     return 0
   fi
-  log "Applying available upgrades..."
-  apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+  # Ubuntu 26+ (and 24+): full-upgrade handles changed dependencies cleanly
+  if [[ "$UBUNTU_GE_24" -eq 1 ]]; then
+    log "Applying available upgrades (full-upgrade)..."
+    apt-get full-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+  else
+    log "Applying available upgrades..."
+    apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+  fi
 }
 
 pkg_available() {
@@ -143,7 +221,7 @@ backup_file() {
   info "Backed up $src -> $dest"
 }
 
-# --- SSH service helpers ---
+# --- SSH service helpers (Ubuntu 24+/26+: ssh.socket + sshd-socket-generator) ---
 ssh_service_name() {
   if systemctl list-unit-files ssh.service 2>/dev/null | grep -q '^ssh\.service'; then
     echo ssh
@@ -158,11 +236,40 @@ ssh_service_name() {
   fi
 }
 
+# Port from systemd socket ListenStream (authoritative under socket activation)
+ssh_socket_listen_port() {
+  local line port
+  # Live unit properties first
+  while IFS= read -r line; do
+    port="$(printf '%s' "$line" | sed -nE 's/.*[=:]([0-9]+)$/\1/p')"
+    if [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)); then
+      echo "$port"
+      return 0
+    fi
+  done < <(systemctl show ssh.socket -p Listen --value 2>/dev/null | tr ' ' '\n')
+
+  # Unit file / drop-ins
+  while IFS= read -r line; do
+    port="$(printf '%s' "$line" | sed -nE 's/^ListenStream=.*:([0-9]+)$/\1/p')"
+    [[ -z "$port" ]] && port="$(printf '%s' "$line" | sed -nE 's/^ListenStream=([0-9]+)$/\1/p')"
+    if [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)); then
+      echo "$port"
+      return 0
+    fi
+  done < <(systemctl cat ssh.socket 2>/dev/null | grep -E '^ListenStream=')
+  return 1
+}
+
 current_ssh_port() {
-  local port
-  port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')" || true
+  local port=""
+  if [[ "${SSH_SOCKET_ACTIVATION:-0}" -eq 1 ]]; then
+    port="$(ssh_socket_listen_port || true)"
+  fi
   if [[ -z "$port" ]]; then
-    port="$(grep -E '^\s*Port\s+' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | tail -1)" || true
+    port="$(sshd -T 2>/dev/null | awk '/^port / {print $2; exit}')" || true
+  fi
+  if [[ -z "$port" ]]; then
+    port="$(grep -hE '^\s*Port\s+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | tail -1)" || true
   fi
   port="${port:-22}"
   [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || port=22
@@ -181,6 +288,20 @@ restart_ssh() {
     sshd -t || true
     return 1
   fi
+
+  # Ubuntu 24.04+ / 26.04+: Port/ListenAddress are applied via sshd-socket-generator
+  if [[ "${SSH_SOCKET_ACTIVATION:-0}" -eq 1 ]]; then
+    systemctl daemon-reload
+    systemctl enable ssh.socket >/dev/null 2>&1 || true
+    systemctl restart ssh.socket
+    # Reload running daemon (if any sessions hold ssh.service active)
+    systemctl try-reload-or-restart "$svc" >/dev/null 2>&1 \
+      || systemctl kill -s HUP "$svc" >/dev/null 2>&1 \
+      || true
+    success "SSH reloaded (ssh.socket + ${svc})"
+    return 0
+  fi
+
   systemctl restart "$svc"
   systemctl enable "$svc" >/dev/null 2>&1 || true
   success "SSH service ($svc) restarted"
@@ -236,10 +357,12 @@ maxretry = 3
 EOF
   fi
 
-  # Prefer systemd journal when auth.log is absent (some minimal images)
-  if [[ ! -f /var/log/auth.log ]]; then
+  # Ubuntu 26+ / journal-first installs: prefer systemd backend always on modern Ubuntu
+  if [[ "$UBUNTU_GE_24" -eq 1 ]] || [[ ! -f /var/log/auth.log ]]; then
     sed -i '/^\[sshd\]/,/^\[/{s/^logpath/#logpath/}' /etc/fail2ban/jail.local 2>/dev/null || true
-    if ! grep -q '^backend' /etc/fail2ban/jail.local; then
+    if grep -qE '^backend\s*=' /etc/fail2ban/jail.local; then
+      sed -i 's/^backend\s*=.*/backend = systemd/' /etc/fail2ban/jail.local
+    else
       sed -i '/^\[DEFAULT\]/a backend = systemd' /etc/fail2ban/jail.local
     fi
   fi
@@ -254,6 +377,7 @@ configure_unattended_upgrades() {
   log "Configuring automatic security updates..."
 
   if [[ "$IS_UBUNTU" -eq 1 ]]; then
+    # Codename placeholders work for 26.04 (resolute) and any newer release
     cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -262,6 +386,7 @@ Unattended-Upgrade::Allowed-Origins {
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
@@ -289,6 +414,168 @@ EOF
   success "Unattended upgrades configured for ${DISTRO_ID}"
 }
 
+# --- Post-quantum SSH (hybrid KEM key exchange) ---
+# Protects against harvest-now-decrypt-later. Requires OpenSSH 9.0+ (sntrup) or 9.9+/10 (ML-KEM).
+# Set ALLOW_CLASSICAL_KEX=1 to also permit classical KEX for legacy clients.
+
+ssh_query_algs() {
+  local kind="$1"
+  if command -v ssh >/dev/null 2>&1; then
+    ssh -Q "$kind" 2>/dev/null || true
+  fi
+}
+
+ssh_filter_supported() {
+  # Usage: ssh_filter_supported kex alg1 alg2 ...
+  local kind="$1"
+  shift
+  local supported wanted out=()
+  supported="$(ssh_query_algs "$kind")"
+  [[ -n "$supported" ]] || { printf '%s' "$*" | tr ' ' ','; return 0; }
+  local a
+  for a in "$@"; do
+    if printf '%s\n' "$supported" | grep -qxF "$a"; then
+      out+=("$a")
+    fi
+  done
+  ((${#out[@]})) || return 1
+  local IFS=,
+  echo "${out[*]}"
+}
+
+ensure_ssh_host_keys() {
+  [[ "${SKIP_SSH_HOST_KEY_GEN:-0}" == "1" ]] && return 0
+  # Ed25519 is required for our HostKey preference
+  if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
+    log "Generating Ed25519 host key..."
+    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
+  fi
+  if [[ ! -f /etc/ssh/ssh_host_ecdsa_key ]]; then
+    ssh-keygen -t ecdsa -b 256 -f /etc/ssh/ssh_host_ecdsa_key -N "" -q || true
+  fi
+  if [[ ! -f /etc/ssh/ssh_host_rsa_key ]]; then
+    ssh-keygen -t rsa -b 3072 -f /etc/ssh/ssh_host_rsa_key -N "" -q || true
+  fi
+}
+
+build_pq_kex_list() {
+  local pq classical kex
+  # Prefer NIST ML-KEM-768 hybrid, then Streamlined NTRU Prime hybrid
+  pq="$(ssh_filter_supported kex \
+    mlkem768x25519-sha256 \
+    sntrup761x25519-sha512 \
+    sntrup761x25519-sha512@openssh.com \
+    || true)"
+
+  classical="$(ssh_filter_supported kex \
+    curve25519-sha256 \
+    curve25519-sha256@libssh.org \
+    ecdh-sha2-nistp256 \
+    ecdh-sha2-nistp384 \
+    ecdh-sha2-nistp521 \
+    || true)"
+
+  if [[ -n "$pq" ]]; then
+    if [[ "${ALLOW_CLASSICAL_KEX:-0}" == "1" && -n "$classical" ]]; then
+      kex="${pq},${classical}"
+      warn "ALLOW_CLASSICAL_KEX=1: classical key exchange permitted (not fully PQ for all clients)"
+    else
+      kex="$pq"
+    fi
+    echo "$kex"
+    return 0
+  fi
+
+  # No PQ algorithms in this OpenSSH build
+  if [[ "${ALLOW_CLASSICAL_KEX:-0}" == "1" && -n "$classical" ]]; then
+    warn "No post-quantum KEX available; using classical KEX only (ALLOW_CLASSICAL_KEX=1)"
+    echo "$classical"
+    return 0
+  fi
+  return 1
+}
+
+apply_ssh_post_quantum() {
+  local dropin="$1"
+  local client="${SSH_CLIENT_DROPIN:-/etc/ssh/ssh_config.d/99-security-hardening.conf}"
+  local kex hostkeys pubkeys ciphers macs crypto tmp line
+
+  ensure_ssh_host_keys
+
+  kex="$(build_pq_kex_list)" || {
+    error "This OpenSSH build has no post-quantum KEX (need OpenSSH ≥ 9.0 with sntrup/ML-KEM)"
+    error "Upgrade openssh-server, or set ALLOW_CLASSICAL_KEX=1 (not PQ-secure)"
+    return 1
+  }
+
+  hostkeys="$(ssh_filter_supported key-sig \
+    ssh-ed25519 \
+    ssh-ed25519-cert-v01@openssh.com \
+    sk-ssh-ed25519@openssh.com \
+    sk-ssh-ed25519-cert-v01@openssh.com \
+    ecdsa-sha2-nistp256 \
+    ecdsa-sha2-nistp384 \
+    ecdsa-sha2-nistp521 \
+    rsa-sha2-512 \
+    rsa-sha2-256 \
+    || echo 'ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256')"
+
+  pubkeys="$hostkeys"
+
+  ciphers="$(ssh_filter_supported cipher \
+    chacha20-poly1305@openssh.com \
+    aes256-gcm@openssh.com \
+    aes128-gcm@openssh.com \
+    || echo 'chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com')"
+
+  macs="$(ssh_filter_supported mac \
+    hmac-sha2-512-etm@openssh.com \
+    hmac-sha2-256-etm@openssh.com \
+    umac-128-etm@openssh.com \
+    || echo 'hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com')"
+
+  crypto=$(cat << EOF
+# Post-quantum hybrid key exchange (ML-KEM-768 / sntrup761 + X25519)
+# Classical-only KEX disabled unless ALLOW_CLASSICAL_KEX=1
+KexAlgorithms ${kex}
+HostKeyAlgorithms ${hostkeys}
+PubkeyAcceptedAlgorithms ${pubkeys}
+Ciphers ${ciphers}
+MACs ${macs}
+EOF
+)
+
+  tmp="$(mktemp)"
+  if grep -q 'PLACEHOLDER_SSH_PQ_CRYPTO' "$dropin" 2>/dev/null; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == *PLACEHOLDER_SSH_PQ_CRYPTO* ]]; then
+        printf '%s\n' "$crypto"
+      else
+        printf '%s\n' "$line"
+      fi
+    done < "$dropin" > "$tmp"
+  else
+    # Refresh existing PQ / crypto lines then append
+    grep -vE '^(# Post-quantum hybrid key exchange|# Classical-only KEX|KexAlgorithms |HostKeyAlgorithms |PubkeyAcceptedAlgorithms |Ciphers |MACs )' "$dropin" > "$tmp" || true
+    printf '\n%s\n' "$crypto" >> "$tmp"
+  fi
+  mv "$tmp" "$dropin"
+
+  mkdir -p "$(dirname "$client")"
+  cat > "$client" << EOF
+# Managed by SecurityHardening suite — post-quantum client defaults
+Host *
+    KexAlgorithms ${kex}
+    HostKeyAlgorithms ${hostkeys}
+    PubkeyAcceptedAlgorithms ${pubkeys}
+    Ciphers ${ciphers}
+    MACs ${macs}
+EOF
+
+  info "Post-quantum KEX: ${kex}"
+  success "SSH post-quantum crypto applied (server + client defaults)"
+}
+
 # --- SSH hardening via drop-in (safe; does not wipe vendor config) ---
 configure_ssh_hardening() {
   local dropin="/etc/ssh/sshd_config.d/99-security-hardening.conf"
@@ -297,8 +584,10 @@ configure_ssh_hardening() {
     warn "openssh-server not installed; installing..."
     install_packages openssh-server
   fi
+  # Re-detect after install (Ubuntu 26 ships ssh.socket with the package)
+  detect_ssh_socket_activation
 
-  log "Hardening SSH (drop-in config)..."
+  log "Hardening SSH (drop-in config + post-quantum KEX)..."
   mkdir -p /etc/ssh/sshd_config.d
   backup_file /etc/ssh/sshd_config
 
@@ -321,13 +610,43 @@ ClientAliveCountMax 2
 AllowAgentForwarding no
 AllowTcpForwarding no
 DebianBanner no
+HostKey /etc/ssh/ssh_host_ed25519_key
+# PLACEHOLDER_SSH_PQ_CRYPTO
 EOF
   fi
 
-  # Ensure Include is present (Debian/Ubuntu default)
-  if ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
+  # Ensure Include is present (Debian/Ubuntu default; OpenSSH 9+/10 on Ubuntu 26)
+  if [[ -f /etc/ssh/sshd_config ]] \
+    && ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
     backup_file /etc/ssh/sshd_config
     sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+  fi
+
+  apply_ssh_post_quantum "$dropin" || return 1
+
+  # Only keep HostKey lines for keys that exist
+  if [[ ! -f /etc/ssh/ssh_host_ecdsa_key ]]; then
+    sed -i '\|/etc/ssh/ssh_host_ecdsa_key|d' "$dropin"
+  fi
+  if [[ ! -f /etc/ssh/ssh_host_rsa_key ]]; then
+    sed -i '\|/etc/ssh/ssh_host_rsa_key|d' "$dropin"
+  fi
+
+  # If a directive is rejected by this OpenSSH build, strip and re-validate
+  if ! sshd -t 2>/dev/null; then
+    warn "sshd rejected drop-in; removing unknown keys and retrying"
+    local bad
+    bad="$(sshd -t 2>&1 || true)"
+    info "$bad"
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      sed -i -E "s/^[[:space:]]*${key}[[:space:]].*/# & (disabled: unsupported on this OpenSSH)/I" "$dropin"
+    done < <(printf '%s\n' "$bad" | sed -nE 's/.*[Uu]nsupported option[= ]+([A-Za-z0-9]+).*/\1/p; s/.*Bad configuration option[=: ]+([A-Za-z0-9]+).*/\1/p')
+    if ! sshd -t 2>/dev/null; then
+      error "SSH hardening drop-in still invalid; leaving previous SSH config active"
+      rm -f "$dropin"
+      return 1
+    fi
   fi
 
   restart_ssh
@@ -481,9 +800,12 @@ journalctl -u ssh -u sshd --since "24 hours ago" 2>/dev/null | grep -i "Failed p
   || echo "none"
 echo ""
 echo "=== Services ==="
-for s in ufw fail2ban apparmor auditd clamav-daemon; do
+for s in ufw fail2ban apparmor auditd clamav-daemon ssh.socket ssh sshd; do
   printf "%-16s %s\n" "$s" "$(systemctl is-active "$s" 2>/dev/null || echo n/a)"
 done
+echo ""
+echo "=== SSH KEX (post-quantum) ==="
+sshd -T 2>/dev/null | grep -i kexalgorithms || echo "sshd not available"
 echo ""
 echo "=== Updates ==="
 apt list --upgradable 2>/dev/null | grep -v "Listing..." | head -20 || true
@@ -509,7 +831,7 @@ free -h | head -2
 df -h / | tail -1
 echo ""
 echo "=== Services ==="
-systemctl is-active ufw fail2ban clamav-daemon auditd apparmor 2>/dev/null || true
+systemctl is-active ufw fail2ban clamav-daemon auditd apparmor ssh.socket ssh sshd 2>/dev/null || true
 echo ""
 echo "=== Firewall ==="
 ufw status verbose 2>/dev/null || true

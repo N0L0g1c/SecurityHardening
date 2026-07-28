@@ -27,11 +27,13 @@ Options:
   -h, --help          show this help
 
 Environment:
-  SKIP_APT_UPGRADE=1  skip apt upgrade (faster re-runs; still updates indexes)
+  SKIP_APT_UPGRADE=1     skip apt upgrade (faster re-runs; still updates indexes)
+  ALLOW_CLASSICAL_KEX=1  allow non-PQ SSH key exchange for legacy clients
 
 Examples:
   sudo $0 --level quick -y
   sudo SKIP_APT_UPGRADE=1 $0 --level standard -y
+  sudo ALLOW_CLASSICAL_KEX=1 $0 --level quick -y
 EOF
 }
 
