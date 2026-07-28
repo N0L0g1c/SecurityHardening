@@ -24,6 +24,7 @@ SUITE_ROOT="$(cd "${_COMMON_DIR}/.." && pwd)"
 CONFIG_DIR="${SUITE_ROOT}/security_configs"
 LOG_FILE="${LOG_FILE:-/var/log/security-hardening.log}"
 BACKUP_DIR="${BACKUP_DIR:-/etc/security/backups}"
+DRY_RUN="${DRY_RUN:-0}"
 
 # --- Logging ---
 _ensure_log() {
@@ -36,6 +37,17 @@ warn()    { _ensure_log; echo -e "${YELLOW}[WARNING]${NC} $*" | tee -a "$LOG_FIL
 error()   { _ensure_log; echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"; }
 info()    { _ensure_log; echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
 success() { _ensure_log; echo -e "${GREEN}[SUCCESS]${NC} $*" | tee -a "$LOG_FILE"; }
+
+dry_run() { [[ "${DRY_RUN}" == "1" ]]; }
+
+dry_skip() {
+  # Usage: if dry_skip "desc"; then return 0; fi
+  if dry_run; then
+    info "[dry-run] would: $*"
+    return 0
+  fi
+  return 1
+}
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -154,6 +166,7 @@ ensure_ubuntu_components() {
 }
 
 apt_update() {
+  if dry_skip "apt-get update"; then return 0; fi
   ensure_ubuntu_components
   log "Updating package lists..."
   apt-get update -qq
@@ -164,6 +177,7 @@ apt_upgrade() {
     info "Skipping apt upgrade (SKIP_APT_UPGRADE=1)"
     return 0
   fi
+  if dry_skip "apt-get full-upgrade/upgrade"; then return 0; fi
   # Ubuntu 26+ (and 24+): full-upgrade handles changed dependencies cleanly
   if [[ "$UBUNTU_GE_24" -eq 1 ]]; then
     log "Applying available upgrades (full-upgrade)..."
@@ -206,8 +220,86 @@ install_packages() {
     return 0
   fi
 
+  if dry_skip "apt-get install ${available[*]}"; then return 0; fi
+
   log "Installing: ${available[*]}"
   apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "${available[@]}"
+}
+
+# --- Snapshot / restore ---
+create_hardening_snapshot() {
+  if dry_skip "create hardening snapshot under ${BACKUP_DIR}"; then return 0; fi
+  if [[ "${SKIP_SNAPSHOT:-0}" == "1" ]]; then
+    info "Skipping snapshot (SKIP_SNAPSHOT=1)"
+    return 0
+  fi
+
+  local stamp archive manifest
+  stamp="$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+  archive="${BACKUP_DIR}/snapshot-${stamp}.tar.gz"
+  manifest="${BACKUP_DIR}/snapshot-${stamp}.manifest"
+
+  log "Creating pre-hardening snapshot: ${archive}"
+  # shellcheck disable=SC2046
+  tar -czf "$archive" \
+    --ignore-failed-read \
+    -C / \
+    etc/ssh/sshd_config \
+    etc/ssh/sshd_config.d \
+    etc/ssh/ssh_config.d \
+    etc/systemd/system/ssh.socket.d \
+    etc/fail2ban/jail.local \
+    etc/apt/apt.conf.d/20auto-upgrades \
+    etc/apt/apt.conf.d/50unattended-upgrades \
+    etc/sysctl.d/99-security-hardening.conf \
+    etc/security/pwquality.conf \
+    etc/pam.d/common-password \
+    etc/audit/rules.d \
+    etc/sudoers.d/99-security-hardening \
+    etc/fstab \
+    etc/default/ufw \
+    etc/ufw/user.rules \
+    etc/ufw/user6.rules \
+    2>/dev/null || true
+
+  {
+    echo "stamp=${stamp}"
+    echo "created=$(date -Iseconds)"
+    echo "host=$(hostname)"
+    echo "os=${PRETTY_NAME:-unknown}"
+  } > "$manifest"
+  ln -sfn "snapshot-${stamp}.tar.gz" "${BACKUP_DIR}/latest-snapshot.tar.gz"
+  ln -sfn "snapshot-${stamp}.manifest" "${BACKUP_DIR}/latest-snapshot.manifest"
+  success "Snapshot saved (${archive})"
+}
+
+restore_hardening_snapshot() {
+  local archive="${1:-}"
+  if [[ -z "$archive" ]]; then
+    archive="${BACKUP_DIR}/latest-snapshot.tar.gz"
+  fi
+  if [[ ! -f "$archive" ]]; then
+    error "Snapshot not found: ${archive}"
+    return 1
+  fi
+  if dry_skip "restore snapshot from ${archive}"; then return 0; fi
+
+  log "Restoring snapshot ${archive}..."
+  tar -xzf "$archive" -C /
+  # Remove suite-managed drop-ins that may not be in older snapshots
+  # (keep restored files as authoritative for paths present in the archive)
+  systemctl daemon-reload 2>/dev/null || true
+  if [[ -f /etc/ssh/sshd_config.d/99-security-hardening.conf ]] || [[ -d /etc/ssh ]]; then
+    detect_ssh_socket_activation
+    restart_ssh || true
+  fi
+  systemctl restart fail2ban 2>/dev/null || true
+  if command -v augenrules >/dev/null 2>&1; then
+    augenrules --load 2>/dev/null || systemctl restart auditd 2>/dev/null || true
+  fi
+  success "Restore complete from ${archive}"
+  warn "Review UFW manually if firewall rules changed: ufw status verbose"
 }
 
 # --- Backup ---
@@ -310,6 +402,7 @@ restart_ssh() {
 # --- Firewall ---
 configure_ufw() {
   local ssh_port
+  if dry_skip "configure UFW firewall"; then return 0; fi
   ssh_port="$(current_ssh_port)"
 
   log "Configuring UFW (SSH port ${ssh_port})..."
@@ -337,6 +430,7 @@ configure_ufw() {
 
 # --- Fail2ban ---
 configure_fail2ban() {
+  if dry_skip "configure fail2ban"; then return 0; fi
   log "Configuring fail2ban..."
   mkdir -p /etc/fail2ban
   if [[ -f "${CONFIG_DIR}/fail2ban_jail.local" ]]; then
@@ -374,6 +468,7 @@ EOF
 
 # --- Unattended upgrades (Debian vs Ubuntu origins) ---
 configure_unattended_upgrades() {
+  if dry_skip "configure unattended-upgrades"; then return 0; fi
   log "Configuring automatic security updates..."
 
   if [[ "$IS_UBUNTU" -eq 1 ]]; then
@@ -576,9 +671,97 @@ EOF
   success "SSH post-quantum crypto applied (server + client defaults)"
 }
 
+# --- SSH auth policy (password disable only when keys exist, unless forced) ---
+ssh_authorized_keys_present() {
+  local f
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-ssh-)' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_ssh_password_policy() {
+  local dropin="$1"
+  local mode="${SSH_DISABLE_PASSWORD_AUTH:-auto}"
+
+  case "$mode" in
+    0|no|false|keep)
+      sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' "$dropin"
+      info "SSH password authentication kept enabled (SSH_DISABLE_PASSWORD_AUTH=${mode})"
+      ;;
+    1|yes|true|force)
+      if ssh_authorized_keys_present || [[ "${SSH_FORCE_DISABLE_PASSWORD:-0}" == "1" ]]; then
+        sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/' "$dropin"
+        success "SSH password authentication disabled"
+        if ! ssh_authorized_keys_present; then
+          warn "No authorized_keys found — SSH_FORCE_DISABLE_PASSWORD=1 used; ensure console access"
+        fi
+      else
+        warn "Refusing to disable SSH passwords: no authorized_keys found"
+        warn "Add keys, or set SSH_FORCE_DISABLE_PASSWORD=1 with console access"
+        sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' "$dropin"
+      fi
+      ;;
+    auto|*)
+      if ssh_authorized_keys_present; then
+        sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/' "$dropin"
+        success "SSH password authentication disabled (authorized_keys detected)"
+      else
+        sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' "$dropin"
+        info "SSH passwords kept enabled (no authorized_keys; set SSH_DISABLE_PASSWORD_AUTH=1 after adding keys)"
+      fi
+      ;;
+  esac
+}
+
+apply_ssh_listen_port() {
+  local dropin="$1"
+  local port="${SSH_PORT:-}"
+  local old_port
+
+  [[ -n "$port" ]] || return 0
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+    error "Invalid SSH_PORT=${port}"
+    return 1
+  fi
+
+  old_port="$(current_ssh_port)"
+  log "Setting SSH listen port to ${port} (was ${old_port})..."
+
+  # Ensure UFW allows the new port before switching
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${port}/tcp" comment 'SSH' >/dev/null 2>&1 || true
+  fi
+
+  # sshd_config Port (used by sshd-socket-generator on Ubuntu 24+/26+)
+  if grep -qE '^Port[[:space:]]+' "$dropin"; then
+    sed -i -E "s/^Port[[:space:]].*/Port ${port}/" "$dropin"
+  else
+    printf '\nPort %s\n' "$port" >> "$dropin"
+  fi
+
+  if [[ "${SSH_SOCKET_ACTIVATION:-0}" -eq 1 ]]; then
+    mkdir -p /etc/systemd/system/ssh.socket.d
+    cat > /etc/systemd/system/ssh.socket.d/override.conf << EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:${port}
+ListenStream=[::]:${port}
+EOF
+    systemctl daemon-reload
+  fi
+
+  success "SSH port configured to ${port}"
+}
+
 # --- SSH hardening via drop-in (safe; does not wipe vendor config) ---
 configure_ssh_hardening() {
   local dropin="/etc/ssh/sshd_config.d/99-security-hardening.conf"
+
+  if dry_skip "harden SSH (PQ KEX, auth policy, optional port)"; then return 0; fi
 
   if ! dpkg -s openssh-server >/dev/null 2>&1; then
     warn "openssh-server not installed; installing..."
@@ -623,6 +806,8 @@ EOF
   fi
 
   apply_ssh_post_quantum "$dropin" || return 1
+  apply_ssh_password_policy "$dropin"
+  apply_ssh_listen_port "$dropin" || return 1
 
   # Only keep HostKey lines for keys that exist
   if [[ ! -f /etc/ssh/ssh_host_ecdsa_key ]]; then
@@ -655,6 +840,7 @@ EOF
 # --- Password policy ---
 configure_password_policy() {
   local minlen="${1:-12}"
+  if dry_skip "configure password policy (minlen=${minlen})"; then return 0; fi
 
   log "Configuring password policy (minlen=${minlen})..."
   install_packages libpam-pwquality
@@ -688,6 +874,7 @@ EOF
 # --- Kernel / sysctl ---
 configure_sysctl() {
   local conf="/etc/sysctl.d/99-security-hardening.conf"
+  if dry_skip "apply kernel sysctl hardening"; then return 0; fi
 
   log "Applying kernel hardening (sysctl)..."
   cat > "$conf" << 'EOF'
@@ -721,8 +908,14 @@ kernel.dmesg_restrict = 1
 kernel.yama.ptrace_scope = 1
 kernel.core_uses_pid = 1
 kernel.sysrq = 0
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+vm.mmap_min_addr = 65536
+fs.suid_dumpable = 0
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
 EOF
 
   # Apply keys that exist; ignore unknowns (no set -e abort)
@@ -733,17 +926,27 @@ EOF
     sysctl -w "${key}=${value}" >/dev/null 2>&1 || warn "sysctl skip: ${key}"
   done < "$conf"
 
+  # Disable core dumps via limits
+  if ! grep -q 'SecurityHardening coredump' /etc/security/limits.d/99-security-hardening.conf 2>/dev/null; then
+    mkdir -p /etc/security/limits.d
+    cat > /etc/security/limits.d/99-security-hardening.conf << 'EOF'
+# SecurityHardening coredump
+* hard core 0
+* soft core 0
+EOF
+  fi
+
   success "Kernel parameters applied via ${conf}"
 }
 
 # --- AppArmor ---
 configure_apparmor() {
+  if dry_skip "configure AppArmor"; then return 0; fi
   log "Enabling AppArmor..."
   install_packages apparmor apparmor-utils
   systemctl enable apparmor >/dev/null 2>&1 || true
   systemctl start apparmor >/dev/null 2>&1 || true
   if command -v aa-enforce >/dev/null 2>&1 && [[ -d /etc/apparmor.d ]]; then
-    # Enforce only profiles that load cleanly
     find /etc/apparmor.d -maxdepth 1 -type f ! -name '*.dpkg-*' ! -name '*~' -print0 2>/dev/null \
       | xargs -0 -r -n1 aa-enforce >/dev/null 2>&1 || warn "Some AppArmor profiles could not be enforced"
   fi
@@ -752,20 +955,105 @@ configure_apparmor() {
 
 # --- auditd ---
 configure_auditd() {
+  if dry_skip "configure auditd + hardening rules"; then return 0; fi
   log "Enabling auditd..."
   install_packages auditd audispd-plugins
   systemctl enable auditd
-  systemctl start auditd || systemctl start audit-rules || true
-  success "auditd enabled"
+
+  mkdir -p /etc/audit/rules.d
+  if [[ -f "${CONFIG_DIR}/audit-hardening.rules" ]]; then
+    cp "${CONFIG_DIR}/audit-hardening.rules" /etc/audit/rules.d/99-security-hardening.rules
+  fi
+
+  if command -v augenrules >/dev/null 2>&1; then
+    augenrules --load 2>/dev/null || warn "augenrules load failed (may need reboot if rules locked)"
+  fi
+  systemctl restart auditd 2>/dev/null || systemctl start auditd || systemctl start audit-rules || true
+  success "auditd enabled with hardening rules"
+}
+
+# --- Privilege lockdown (packages, mounts, sudo, ctrl-alt-del) ---
+configure_privilege_lockdown() {
+  if dry_skip "privilege lockdown (legacy pkgs, mounts, sudo, ctrl-alt-del)"; then return 0; fi
+  log "Applying privilege lockdown..."
+
+  # Mask sudden reboot via Ctrl-Alt-Del
+  systemctl mask ctrl-alt-del.target >/dev/null 2>&1 || true
+
+  # Remove clearly insecure legacy network clients/servers if present
+  local legacy=(
+    telnet
+    telnetd
+    inetutils-telnetd
+    rsh-client
+    rsh-redone-client
+    rsh-server
+    rsh-redone-server
+    talk
+    talkd
+    ntalk
+    finger
+    fingerd
+    tftpd
+    tftpd-hpa
+  )
+  local remove=()
+  local p
+  for p in "${legacy[@]}"; do
+    if dpkg -s "$p" >/dev/null 2>&1; then
+      remove+=("$p")
+    fi
+  done
+  if ((${#remove[@]})); then
+    log "Removing legacy packages: ${remove[*]}"
+    apt-get remove -y --purge "${remove[@]}" || warn "Some legacy packages could not be removed"
+  else
+    info "No legacy telnet/rsh/talk packages installed"
+  fi
+
+  # Secure /dev/shm and /tmp mount options (nodev,nosuid; noexec on shm only)
+  if [[ -f /etc/fstab ]]; then
+    backup_file /etc/fstab
+    if grep -qE '[[:space:]]/dev/shm[[:space:]]' /etc/fstab; then
+      sed -i -E 's|([[:space:]]/dev/shm[[:space:]]+tmpfs[[:space:]]+)([^[:space:]]+)|\1nodev,nosuid,noexec|' /etc/fstab
+    else
+      echo 'tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0' >> /etc/fstab
+    fi
+    if grep -qE '[[:space:]]/tmp[[:space:]]' /etc/fstab; then
+      # Prefer nodev,nosuid on /tmp; avoid noexec (breaks many package scripts)
+      sed -i -E 's|([[:space:]]/tmp[[:space:]]+[^[:space:]]+[[:space:]]+)([^[:space:]]+)|\1nodev,nosuid|' /etc/fstab
+    fi
+    mount -o remount /dev/shm 2>/dev/null || true
+    mount -o remount /tmp 2>/dev/null || true
+  fi
+
+  # Sudo hardening drop-in
+  if [[ -d /etc/sudoers.d ]]; then
+    cat > /etc/sudoers.d/99-security-hardening << 'EOF'
+# Managed by SecurityHardening suite
+Defaults	use_pty
+Defaults	logfile="/var/log/sudo.log"
+Defaults	passwd_timeout=1
+EOF
+    chmod 440 /etc/sudoers.d/99-security-hardening
+    if command -v visudo >/dev/null 2>&1; then
+      if ! visudo -cf /etc/sudoers.d/99-security-hardening >/dev/null 2>&1; then
+        error "sudoers drop-in invalid — removing"
+        rm -f /etc/sudoers.d/99-security-hardening
+      fi
+    fi
+  fi
+
+  success "Privilege lockdown applied"
 }
 
 # --- AIDE ---
 configure_aide() {
+  if dry_skip "initialize AIDE database"; then return 0; fi
   log "Initializing AIDE (may take several minutes)..."
   install_packages aide aide-common
 
   if command -v aideinit >/dev/null 2>&1; then
-    # -y yes to overwrite, -f force; noninteractive
     aideinit -y -f || aideinit || true
   elif command -v aide >/dev/null 2>&1; then
     aide --init || true
@@ -774,7 +1062,6 @@ configure_aide() {
     return 0
   fi
 
-  # Normalize DB path across Debian/Ubuntu versions
   if [[ -f /var/lib/aide/aide.db.new ]]; then
     mv -f /var/lib/aide/aide.db.new /var/lib/aide/aide.db
   elif [[ -f /var/lib/aide/aide.db.new.gz ]]; then
@@ -785,6 +1072,7 @@ configure_aide() {
 
 # --- Monitoring scripts ---
 install_security_check() {
+  if dry_skip "install /usr/local/bin/security-check.sh + daily cron"; then return 0; fi
   cat > /usr/local/bin/security-check.sh << 'EOF'
 #!/bin/bash
 echo "=== Security Status Check ==="
@@ -820,6 +1108,7 @@ EOF
 }
 
 install_security_monitor() {
+  if dry_skip "install /usr/local/bin/security-monitor.sh + daily cron"; then return 0; fi
   cat > /usr/local/bin/security-monitor.sh << 'EOF'
 #!/bin/bash
 echo "=== Advanced Security Monitor ==="
@@ -864,6 +1153,7 @@ print_next_steps() {
   echo "OS: ${PRETTY_NAME:-$DISTRO_ID}"
   echo "Log: $LOG_FILE"
   echo "Backups: $BACKUP_DIR"
+  echo "Latest snapshot: ${BACKUP_DIR}/latest-snapshot.tar.gz"
   echo ""
   echo "Next steps:"
   echo "  1. Keep an open console/session until you verify SSH"
@@ -875,5 +1165,6 @@ print_next_steps() {
   else
     echo "  5. Run: /usr/local/bin/security-check.sh"
   fi
-  echo "  6. Reboot when convenient to apply all kernel/AppArmor changes"
+  echo "  6. Reboot when convenient to apply all kernel/AppArmor/mount changes"
+  echo "  7. Rollback if needed: sudo ./restore.sh"
 }

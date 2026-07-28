@@ -1,6 +1,6 @@
 #!/bin/bash
 # Quick Security Setup — Debian / Ubuntu
-# Basic firewall, fail2ban, unattended upgrades, SSH hardening
+# Basic firewall, fail2ban, unattended upgrades, SSH hardening + snapshot
 
 set -euo pipefail
 
@@ -10,6 +10,7 @@ source "${SUITE_ROOT}/lib/common.sh"
 
 require_root
 detect_os
+create_hardening_snapshot
 
 log "Starting Quick Security Setup..."
 
@@ -21,6 +22,7 @@ configure_ufw
 configure_fail2ban
 configure_unattended_upgrades
 configure_ssh_hardening
+configure_privilege_lockdown
 install_security_check
 
 success "Quick security setup completed"

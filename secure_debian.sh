@@ -1,6 +1,6 @@
 #!/bin/bash
 # Standard Security Hardening — Debian / Ubuntu
-# Firewall, fail2ban, SSH, password policy, sysctl, AppArmor, AIDE, auditd
+# Firewall, fail2ban, SSH, password policy, sysctl, AppArmor, AIDE, auditd, lockdown
 
 set -euo pipefail
 
@@ -10,6 +10,7 @@ source "${SUITE_ROOT}/lib/common.sh"
 
 require_root
 detect_os
+create_hardening_snapshot
 
 log "Starting Standard Security Hardening..."
 
@@ -45,11 +46,12 @@ configure_password_policy 12
 configure_sysctl
 configure_apparmor
 configure_auditd
+configure_privilege_lockdown
 configure_aide
 install_security_check
 
 # Soft limits (append once)
-if ! grep -q 'SecurityHardening suite' /etc/security/limits.conf 2>/dev/null; then
+if ! dry_run && ! grep -q 'SecurityHardening suite' /etc/security/limits.conf 2>/dev/null; then
   backup_file /etc/security/limits.conf
   cat >> /etc/security/limits.conf << 'EOF'
 

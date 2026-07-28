@@ -7,11 +7,12 @@ Automated security hardening for **Debian** and **Ubuntu**, with first-class sup
 ```bash
 cd SecurityHardening
 chmod +x install.sh
-sudo ./install.sh                  # interactive menu
-sudo ./install.sh --level quick -y # fully automated
+sudo ./install.sh --dry-run --level standard   # preview
+sudo ./install.sh --level quick -y
 sudo ./install.sh --level standard -y
 sudo ./install.sh --level advanced -y
-sudo SKIP_APT_UPGRADE=1 ./install.sh --level standard -y  # re-run without full upgrade
+sudo SSH_PORT=2222 SSH_DISABLE_PASSWORD_AUTH=1 ./install.sh --level standard -y
+sudo ./install.sh --restore                    # rollback latest snapshot
 ```
 
 Or run a level script directly:
@@ -34,6 +35,18 @@ sudo ./advanced_security.sh
 | Upgrades | Uses `apt-get full-upgrade` on Ubuntu 24.04+ |
 | Unattended upgrades | Codename-based origins (security, updates, ESM) — future-proof for new releases |
 | Fail2ban | Prefers `backend = systemd` (journal) on Ubuntu 24.04+ |
+
+## High-value hardening (included)
+
+| Feature | Behavior |
+|---------|----------|
+| SSH password policy | `auto`: disable passwords when `authorized_keys` exist; never lock out without keys unless forced |
+| SSH port | `SSH_PORT=N` updates drop-in + `ssh.socket` override on Ubuntu 24+/26+ |
+| Auditd rules | CIS-style rules in `security_configs/audit-hardening.rules` → `/etc/audit/rules.d/` |
+| Privilege lockdown | Remove telnet/rsh/talk; mask `ctrl-alt-del`; harden `/tmp` & `/dev/shm`; sudo `use_pty` + logfile |
+| Sysctl extras | `fs.suid_dumpable=0`, BPF harden, `vm.mmap_min_addr`, protected fifos/regular |
+| Snapshot / restore | Pre-run tarball under `/etc/security/backups/`; `sudo ./restore.sh` or `./install.sh --restore` |
+| Dry-run | `sudo ./install.sh --dry-run --level standard` |
 
 ## Post-quantum OpenSSH
 
@@ -76,11 +89,13 @@ sshd -T | grep -i kexalgorithms
 |---------|-------|----------|----------|
 | System updates | yes | yes | yes |
 | UFW + Fail2ban | yes | yes | yes |
-| SSH hardening | yes | yes | yes |
+| SSH + PQ KEX + auth policy | yes | yes | yes |
+| Privilege lockdown | yes | yes | yes |
+| Snapshot / restore | yes | yes | yes |
 | Auto security updates | yes | yes | yes |
 | Password policy | — | yes | yes (stricter) |
-| Kernel sysctl | — | yes | yes |
-| AppArmor + auditd | — | yes | yes |
+| Kernel sysctl + BPF/coredump | — | yes | yes |
+| AppArmor + auditd rules | — | yes | yes |
 | AIDE integrity DB | — | yes | yes |
 | ClamAV | — | — | yes |
 | Optional IDS (psad/portsentry) | — | — | if packaged |
@@ -89,15 +104,17 @@ sshd -T | grep -i kexalgorithms
 ## Layout
 
 ```
-install.sh                 # orchestrator (--level, --yes)
+install.sh                 # --level, --yes, --dry-run, --restore
+restore.sh                 # restore latest (or given) snapshot
 quick_secure.sh
 secure_debian.sh           # standard level
 advanced_security.sh
-lib/common.sh              # shared detection & hardening helpers
+lib/common.sh
 security_configs/
   ssh_hardening.conf
   fail2ban_jail.local
   ufw_rules.sh
+  audit-hardening.rules
 ```
 
 ## Prerequisites

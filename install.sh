@@ -4,9 +4,10 @@
 #
 # Usage:
 #   sudo ./install.sh                  # interactive menu
-#   sudo ./install.sh --level quick
-#   sudo ./install.sh --level standard --yes
-#   sudo ./install.sh --level advanced -y
+#   sudo ./install.sh --level quick -y
+#   sudo ./install.sh --dry-run --level standard
+#   sudo ./install.sh --restore
+#   sudo ./restore.sh [snapshot.tar.gz]
 
 set -euo pipefail
 
@@ -16,6 +17,8 @@ source "${SUITE_ROOT}/lib/common.sh"
 
 LEVEL=""
 ASSUME_YES=0
+DO_RESTORE=0
+RESTORE_ARCHIVE=""
 
 usage() {
   cat << EOF
@@ -24,16 +27,23 @@ Usage: sudo $0 [options]
 Options:
   -l, --level LEVEL   quick | standard | advanced
   -y, --yes           non-interactive (no confirmation prompt)
+  -n, --dry-run       print planned actions; make no changes
+  -r, --restore [FILE] restore latest (or given) pre-hardening snapshot
   -h, --help          show this help
 
 Environment:
-  SKIP_APT_UPGRADE=1     skip apt upgrade (faster re-runs; still updates indexes)
-  ALLOW_CLASSICAL_KEX=1  allow non-PQ SSH key exchange for legacy clients
+  SKIP_APT_UPGRADE=1              skip apt upgrade
+  SKIP_SNAPSHOT=1                 skip pre-run snapshot
+  ALLOW_CLASSICAL_KEX=1           allow non-PQ SSH key exchange
+  SSH_DISABLE_PASSWORD_AUTH=auto  auto|1|0 — disable passwords when keys exist
+  SSH_FORCE_DISABLE_PASSWORD=1    allow disabling passwords with no keys (dangerous)
+  SSH_PORT=2222                   set SSH listen port (updates ssh.socket on Ubuntu 24+/26+)
 
 Examples:
   sudo $0 --level quick -y
-  sudo SKIP_APT_UPGRADE=1 $0 --level standard -y
-  sudo ALLOW_CLASSICAL_KEX=1 $0 --level quick -y
+  sudo $0 --dry-run --level advanced
+  sudo SSH_PORT=2222 SSH_DISABLE_PASSWORD_AUTH=1 $0 --level standard -y
+  sudo $0 --restore
 EOF
 }
 
@@ -46,6 +56,20 @@ while [[ $# -gt 0 ]]; do
     -y|--yes)
       ASSUME_YES=1
       shift
+      ;;
+    -n|--dry-run)
+      DRY_RUN=1
+      export DRY_RUN
+      shift
+      ;;
+    -r|--restore)
+      DO_RESTORE=1
+      if [[ -n "${2:-}" && "${2}" != -* ]]; then
+        RESTORE_ARCHIVE="$2"
+        shift 2
+      else
+        shift
+      fi
       ;;
     -h|--help)
       usage
@@ -67,11 +91,16 @@ fi
 require_root
 detect_os
 
+if [[ "$DO_RESTORE" -eq 1 ]]; then
+  export ASSUME_YES
+  exec bash "${SUITE_ROOT}/restore.sh" ${RESTORE_ARCHIVE:+"$RESTORE_ARCHIVE"}
+fi
+
 if [[ -z "$LEVEL" ]]; then
   echo ""
   echo "SecurityHardening — ${PRETTY_NAME:-$DISTRO_ID}"
-  echo "  1) quick     — firewall, fail2ban, SSH, auto-updates (~5-10 min)"
-  echo "  2) standard  — + password policy, sysctl, AppArmor, AIDE, auditd"
+  echo "  1) quick     — firewall, fail2ban, SSH/PQ, lockdown, auto-updates"
+  echo "  2) standard  — + password policy, sysctl/BPF, AppArmor, AIDE, auditd"
   echo "  3) advanced  — + ClamAV, IDS tools, Lynis monitoring"
   echo ""
   read -r -p "Select level [1-3]: " choice
@@ -83,10 +112,15 @@ if [[ -z "$LEVEL" ]]; then
   esac
 fi
 
-warn "This will change firewall, SSH, and system security settings."
-warn "Keep an active console session until you verify remote SSH still works."
+if dry_run; then
+  warn "DRY-RUN mode: no changes will be made"
+else
+  warn "This will change firewall, SSH, audit, mounts, and system security settings."
+  warn "A snapshot will be saved under ${BACKUP_DIR} (unless SKIP_SNAPSHOT=1)."
+  warn "Keep an active console session until you verify remote SSH still works."
+fi
 
-if [[ "$ASSUME_YES" -ne 1 ]]; then
+if [[ "$ASSUME_YES" -ne 1 ]] && ! dry_run; then
   read -r -p "Continue with '${LEVEL}' hardening? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
 fi
@@ -95,8 +129,18 @@ chmod +x \
   "${SUITE_ROOT}/quick_secure.sh" \
   "${SUITE_ROOT}/secure_debian.sh" \
   "${SUITE_ROOT}/advanced_security.sh" \
+  "${SUITE_ROOT}/restore.sh" \
   "${SUITE_ROOT}/security_configs/ufw_rules.sh" \
   2>/dev/null || true
+
+# Propagate DRY_RUN into child scripts
+export DRY_RUN
+export SSH_PORT="${SSH_PORT:-}"
+export SSH_DISABLE_PASSWORD_AUTH="${SSH_DISABLE_PASSWORD_AUTH:-auto}"
+export SSH_FORCE_DISABLE_PASSWORD="${SSH_FORCE_DISABLE_PASSWORD:-0}"
+export ALLOW_CLASSICAL_KEX="${ALLOW_CLASSICAL_KEX:-0}"
+export SKIP_APT_UPGRADE="${SKIP_APT_UPGRADE:-0}"
+export SKIP_SNAPSHOT="${SKIP_SNAPSHOT:-0}"
 
 case "$LEVEL" in
   quick)    exec bash "${SUITE_ROOT}/quick_secure.sh" ;;
