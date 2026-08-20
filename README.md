@@ -158,4 +158,8 @@ Config backups land in `/etc/security/backups/`.
 
 ## License
 
+[MIT](LICENSE). Copyright © 2026 [Vassbrekke AS](https://www.vassbrekke.no).
+
+Source: https://github.com/Vassbrekke/SecurityHardening
+
 Provided as-is for educational and operational security use. Use at your own risk.
