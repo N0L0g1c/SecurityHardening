@@ -24,6 +24,7 @@ SUITE_ROOT="$(cd "${_COMMON_DIR}/.." && pwd)"
 CONFIG_DIR="${SUITE_ROOT}/security_configs"
 LOG_FILE="${LOG_FILE:-/var/log/security-hardening.log}"
 BACKUP_DIR="${BACKUP_DIR:-/etc/security/backups}"
+SSH_KEX_STATE_FILE="${SSH_KEX_STATE_FILE:-/etc/security/hardening-ssh-kex-mode}"
 DRY_RUN="${DRY_RUN:-0}"
 
 # --- Logging ---
@@ -248,6 +249,7 @@ create_hardening_snapshot() {
     etc/ssh/sshd_config \
     etc/ssh/sshd_config.d \
     etc/ssh/ssh_config.d \
+    etc/security/hardening-ssh-kex-mode \
     etc/systemd/system/ssh.socket.d \
     etc/fail2ban/jail.local \
     etc/apt/apt.conf.d/20auto-upgrades \
@@ -509,9 +511,18 @@ EOF
   success "Unattended upgrades configured for ${DISTRO_ID}"
 }
 
-# --- Post-quantum SSH (hybrid KEM key exchange) ---
-# Protects against harvest-now-decrypt-later. Requires OpenSSH 9.0+ (sntrup) or 9.9+/10 (ML-KEM).
-# Set ALLOW_CLASSICAL_KEX=1 to also permit classical KEX for legacy clients.
+# --- SSH KEX policy (availability-aware post-quantum) ---
+# Modes:
+#   compatibility — do not override KexAlgorithms (vendor default; OpenSSH 9+ already prefers PQ)
+#   pq-preferred  — PQ hybrids first, modern classical fallback (default when unset)
+#   pq-only       — PQ hybrids only; refuses OpenSSH < 9.0 and many appliances
+# ALLOW_CLASSICAL_KEX=1 maps to compatibility. First run prompts unless -y / SSH_KEX_MODE is set.
+
+SSH_CRYPTO_KEX=""
+SSH_CRYPTO_HOSTKEYS=""
+SSH_CRYPTO_CIPHERS=""
+SSH_CRYPTO_MACS=""
+SSH_KEX_PROBE_DIR="/run/security-hardening-kex-probe"
 
 ssh_query_algs() {
   local kind="$1"
@@ -524,7 +535,7 @@ ssh_filter_supported() {
   # Usage: ssh_filter_supported kex alg1 alg2 ...
   local kind="$1"
   shift
-  local supported wanted out=()
+  local supported out=()
   supported="$(ssh_query_algs "$kind")"
   [[ -n "$supported" ]] || { printf '%s' "$*" | tr ' ' ','; return 0; }
   local a
@@ -540,7 +551,6 @@ ssh_filter_supported() {
 
 ensure_ssh_host_keys() {
   [[ "${SKIP_SSH_HOST_KEY_GEN:-0}" == "1" ]] && return 0
-  # Ed25519 is required for our HostKey preference
   if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
     log "Generating Ed25519 host key..."
     ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q
@@ -553,57 +563,283 @@ ensure_ssh_host_keys() {
   fi
 }
 
-build_pq_kex_list() {
-  local pq classical kex
-  # Prefer NIST ML-KEM-768 hybrid, then Streamlined NTRU Prime hybrid
-  pq="$(ssh_filter_supported kex \
+ssh_kex_mode_valid() {
+  case "${1:-}" in
+    compatibility|pq-preferred|pq-only) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ssh_is_over_ssh() {
+  [[ -n "${SSH_CONNECTION:-${SSH_CLIENT:-}}" ]]
+}
+
+ssh_session_peer_ip() {
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    printf '%s\n' "${SSH_CONNECTION%% *}"
+  elif [[ -n "${SSH_CLIENT:-}" ]]; then
+    printf '%s\n' "${SSH_CLIENT%% *}"
+  fi
+}
+
+ssh_session_bind_ip() {
+  printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $3}'
+}
+
+ssh_valid_ip() {
+  local ip="${1:-}"
+  [[ -n "$ip" ]] || return 1
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && return 0
+  [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:.]+$ ]]
+}
+
+ssh_pq_algs() {
+  ssh_filter_supported kex \
     mlkem768x25519-sha256 \
     sntrup761x25519-sha512 \
     sntrup761x25519-sha512@openssh.com \
-    || true)"
+    || true
+}
 
-  classical="$(ssh_filter_supported kex \
+ssh_classical_algs() {
+  ssh_filter_supported kex \
     curve25519-sha256 \
     curve25519-sha256@libssh.org \
     ecdh-sha2-nistp256 \
     ecdh-sha2-nistp384 \
     ecdh-sha2-nistp521 \
-    || true)"
+    || true
+}
 
-  if [[ -n "$pq" ]]; then
-    if [[ "${ALLOW_CLASSICAL_KEX:-0}" == "1" && -n "$classical" ]]; then
-      kex="${pq},${classical}"
-      warn "ALLOW_CLASSICAL_KEX=1: classical key exchange permitted (not fully PQ for all clients)"
+ssh_kex_list_has_classical() {
+  local list="${1:-}"
+  [[ "$list" == *curve25519* || "$list" == *ecdh-sha2* || "$list" == *diffie-hellman* ]]
+}
+
+ssh_kex_list_has_pq() {
+  local list="${1:-}"
+  [[ "$list" == *mlkem768* || "$list" == *sntrup761* ]]
+}
+
+ssh_production_kex() {
+  sshd -T 2>/dev/null | awk '/^kexalgorithms / {print $2; exit}' || true
+}
+
+ssh_production_is_pq_only() {
+  local kex
+  kex="$(ssh_production_kex)"
+  [[ -n "$kex" ]] && ssh_kex_list_has_pq "$kex" && ! ssh_kex_list_has_classical "$kex"
+}
+
+ssh_openssh_pq_level() {
+  local ver
+  ver="$(printf '%s' "${1:-}" | sed -nE 's/.*(OpenSSH[_-])?([0-9]+\.[0-9]+).*/\2/p')"
+  [[ -n "$ver" ]] || { echo unknown; return 0; }
+  if command -v dpkg >/dev/null 2>&1; then
+    if dpkg --compare-versions "$ver" ge 9.9; then echo mlkem; return 0; fi
+    if dpkg --compare-versions "$ver" ge 9.0; then echo sntrup; return 0; fi
+    echo none
+    return 0
+  fi
+  local major="${ver%%.*}"
+  local minor="${ver#*.}"
+  minor="${minor%%.*}"
+  if ((major > 9 || (major == 9 && minor >= 9))); then echo mlkem
+  elif ((major == 9)); then echo sntrup
+  else echo none
+  fi
+}
+
+ssh_recent_client_versions() {
+  local blob=""
+  blob="$(journalctl -u ssh -u ssh.socket -u sshd --since "30 days ago" -o cat 2>/dev/null || true)"
+  blob+=$'\n'
+  blob+="$(grep -hE 'OpenSSH_|Remote protocol version' /var/log/auth.log /var/log/secure 2>/dev/null || true)"
+  printf '%s\n' "$blob" | grep -oE 'OpenSSH_[0-9]+\.[0-9]+[^[:space:]]*' | sort -u
+}
+
+ssh_scan_client_kex_overrides() {
+  grep -hRE '^\s*KexAlgorithms\s+' \
+    /etc/ssh/ssh_config \
+    /etc/ssh/ssh_config.d \
+    /root/.ssh/config \
+    /home/*/.ssh/config \
+    2>/dev/null | grep -vE '^\s*#' | head -20 || true
+}
+
+ssh_peer_version_hints() {
+  local ip blob=""
+  ip="$(ssh_session_peer_ip)"
+  [[ -n "$ip" ]] || return 0
+  blob="$(journalctl -u ssh -u ssh.socket -u sshd --since "7 days ago" -o cat 2>/dev/null | grep -F "$ip" || true)"
+  blob+=$'\n'
+  blob+="$(grep -hF "$ip" /var/log/auth.log /var/log/secure 2>/dev/null || true)"
+  printf '%s\n' "$blob" | grep -oE 'OpenSSH_[0-9]+\.[0-9]+[^[:space:]]*' | sort -u
+}
+
+ssh_print_kex_detection() {
+  local pq classical prod over="no" peer vers level overrides
+  pq="$(ssh_pq_algs)"
+  classical="$(ssh_classical_algs)"
+  prod="$(ssh_production_kex)"
+  ssh_is_over_ssh && over="yes (peer $(ssh_session_peer_ip))"
+  info "SSH KEX detection"
+  info "  Installer over SSH: ${over}"
+  info "  This host PQ KEX:   ${pq:-none}"
+  info "  This host classical:${classical:-none}"
+  info "  Current sshd KEX:   ${prod:-unknown}"
+  vers="$(ssh_recent_client_versions || true)"
+  if [[ -n "$vers" ]]; then
+    while IFS= read -r v; do
+      [[ -n "$v" ]] || continue
+      level="$(ssh_openssh_pq_level "$v")"
+      info "  Seen client: ${v} (PQ capability: ${level})"
+    done <<< "$vers"
+  else
+    info "  Recent SSH client versions: none in logs (LogLevel may hide them)"
+  fi
+  if ssh_is_over_ssh; then
+    peer="$(ssh_peer_version_hints || true)"
+    if [[ -n "$peer" ]]; then
+      info "  This session peer software: ${peer}"
     else
-      kex="$pq"
+      info "  This session peer software: unknown (cannot prove PQ support)"
     fi
-    echo "$kex"
-    return 0
   fi
+  overrides="$(ssh_scan_client_kex_overrides)"
+  if [[ -n "$overrides" ]]; then
+    info "  Local ssh_config KexAlgorithms overrides found:"
+    printf '%s\n' "$overrides" | while IFS= read -r line; do
+      info "    ${line}"
+    done
+  fi
+}
 
-  # No PQ algorithms in this OpenSSH build
-  if [[ "${ALLOW_CLASSICAL_KEX:-0}" == "1" && -n "$classical" ]]; then
-    warn "No post-quantum KEX available; using classical KEX only (ALLOW_CLASSICAL_KEX=1)"
-    echo "$classical"
-    return 0
-  fi
+ssh_legacy_clients_seen() {
+  local v level
+  while IFS= read -r v; do
+    [[ -n "$v" ]] || continue
+    level="$(ssh_openssh_pq_level "$v")"
+    [[ "$level" == "none" ]] && return 0
+  done < <(ssh_recent_client_versions)
   return 1
 }
 
-apply_ssh_post_quantum() {
-  local dropin="$1"
-  local client="${SSH_CLIENT_DROPIN:-/etc/ssh/ssh_config.d/99-security-hardening.conf}"
-  local kex hostkeys pubkeys ciphers macs crypto tmp line
+ssh_kex_algorithms_for_mode() {
+  local pq classical
+  pq="$(ssh_pq_algs)"
+  classical="$(ssh_classical_algs)"
+  case "${SSH_KEX_MODE}" in
+    compatibility)
+      return 0
+      ;;
+    pq-preferred)
+      if [[ -n "$pq" && -n "$classical" ]]; then
+        echo "${pq},${classical}"
+      elif [[ -n "$pq" ]]; then
+        warn "No classical KEX in this OpenSSH build; pq-preferred is effectively pq-only"
+        echo "$pq"
+      elif [[ -n "$classical" ]]; then
+        echo "$classical"
+      else
+        return 1
+      fi
+      ;;
+    pq-only)
+      [[ -n "$pq" ]] || return 1
+      echo "$pq"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
-  ensure_ssh_host_keys
+ssh_warn_kex_availability() {
+  case "${SSH_KEX_MODE}" in
+    pq-only)
+      warn "SSH KEX mode pq-only: clients without hybrid PQ KEX (OpenSSH < 9.0, older PuTTY/Dropbear/libssh, many appliances) will be refused."
+      if ssh_legacy_clients_seen; then
+        warn "Logs show OpenSSH < 9.0 clients have connected recently. pq-only will lock those clients out."
+      fi
+      if ssh_is_over_ssh; then
+        warn "This installer session is itself SSH. Keep this session open. A second connection will be required before pq-only is applied."
+      fi
+      ;;
+    pq-preferred)
+      info "SSH KEX mode pq-preferred: PQ hybrids first; modern classical KEX remains as fallback."
+      ;;
+    compatibility)
+      info "SSH KEX mode compatibility: not overriding KexAlgorithms (vendor OpenSSH policy)."
+      ;;
+  esac
+}
 
-  kex="$(build_pq_kex_list)" || {
-    error "This OpenSSH build has no post-quantum KEX (need OpenSSH ≥ 9.0 with sntrup/ML-KEM)"
-    error "Upgrade openssh-server, or set ALLOW_CLASSICAL_KEX=1 (not PQ-secure)"
+save_ssh_kex_mode() {
+  mkdir -p "$(dirname "$SSH_KEX_STATE_FILE")"
+  printf '%s\n' "$SSH_KEX_MODE" > "$SSH_KEX_STATE_FILE"
+  chmod 644 "$SSH_KEX_STATE_FILE"
+}
+
+resolve_ssh_kex_mode() {
+  local saved="" choice=""
+
+  if [[ "${_SSH_KEX_RESOLVED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  ssh_print_kex_detection
+
+  if ssh_kex_mode_valid "${SSH_KEX_MODE:-}"; then
+    info "SSH_KEX_MODE=${SSH_KEX_MODE} (explicit)"
+  elif [[ "${ALLOW_CLASSICAL_KEX:-0}" == "1" ]]; then
+    SSH_KEX_MODE=compatibility
+    info "ALLOW_CLASSICAL_KEX=1 → SSH_KEX_MODE=compatibility"
+  elif [[ -f "$SSH_KEX_STATE_FILE" ]]; then
+    saved="$(tr -d '[:space:]' < "$SSH_KEX_STATE_FILE" 2>/dev/null || true)"
+    if ssh_kex_mode_valid "$saved"; then
+      SSH_KEX_MODE="$saved"
+      info "Using saved SSH KEX mode: ${SSH_KEX_MODE} (set SSH_KEX_MODE to change)"
+    fi
+  fi
+
+  if ! ssh_kex_mode_valid "${SSH_KEX_MODE:-}"; then
+    if [[ "${ASSUME_YES:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+      SSH_KEX_MODE=pq-preferred
+      warn "SSH_KEX_MODE unset: defaulting to pq-preferred (does not lock out pre-PQ clients)."
+      warn "Pass --kex pq-only or SSH_KEX_MODE=pq-only only after you have verified a second SSH client."
+    else
+      echo ""
+      echo "SSH key-exchange policy (availability vs harvest-now-decrypt-later):"
+      echo "  1) compatibility — keep vendor KEX (OpenSSH already prefers PQ; classical allowed)"
+      echo "  2) pq-preferred  — PQ first, modern classical fallback  [recommended]"
+      echo "  3) pq-only       — refuse classical KEX (OpenSSH ≥ 9.0 / PQ-capable clients only)"
+      echo ""
+      read -r -p "Select KEX mode [1-3] (default 2): " choice
+      case "${choice:-2}" in
+        1|compatibility) SSH_KEX_MODE=compatibility ;;
+        3|pq-only)       SSH_KEX_MODE=pq-only ;;
+        *)               SSH_KEX_MODE=pq-preferred ;;
+      esac
+    fi
+  fi
+
+  export SSH_KEX_MODE
+  _SSH_KEX_RESOLVED=1
+  ssh_warn_kex_availability
+}
+
+ssh_load_crypto_lists() {
+  SSH_CRYPTO_KEX="$(ssh_kex_algorithms_for_mode)" || {
+    if [[ "${SSH_KEX_MODE}" == "pq-only" ]]; then
+      error "This OpenSSH build has no post-quantum KEX (need OpenSSH ≥ 9.0 with sntrup/ML-KEM)"
+      error "Choose --kex pq-preferred or compatibility, or upgrade openssh-server"
+      return 1
+    fi
+    error "Unable to determine supported SSH algorithms"
     return 1
   }
-
-  hostkeys="$(ssh_filter_supported key-sig \
+  SSH_CRYPTO_HOSTKEYS="$(ssh_filter_supported key-sig \
     ssh-ed25519 \
     ssh-ed25519-cert-v01@openssh.com \
     sk-ssh-ed25519@openssh.com \
@@ -614,31 +850,286 @@ apply_ssh_post_quantum() {
     rsa-sha2-512 \
     rsa-sha2-256 \
     || echo 'ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256')"
-
-  pubkeys="$hostkeys"
-
-  ciphers="$(ssh_filter_supported cipher \
+  SSH_CRYPTO_CIPHERS="$(ssh_filter_supported cipher \
     chacha20-poly1305@openssh.com \
     aes256-gcm@openssh.com \
     aes128-gcm@openssh.com \
     || echo 'chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com')"
-
-  macs="$(ssh_filter_supported mac \
+  SSH_CRYPTO_MACS="$(ssh_filter_supported mac \
     hmac-sha2-512-etm@openssh.com \
     hmac-sha2-256-etm@openssh.com \
     umac-128-etm@openssh.com \
     || echo 'hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com')"
+  local n
+  for n in SSH_CRYPTO_KEX SSH_CRYPTO_HOSTKEYS SSH_CRYPTO_CIPHERS SSH_CRYPTO_MACS; do
+    [[ "${!n}" =~ ^[A-Za-z0-9@._,+-]*$ ]] || { error "Refusing unsafe SSH algorithm list (${n})"; return 1; }
+  done
+}
 
-  crypto=$(cat << EOF
-# Post-quantum hybrid key exchange (ML-KEM-768 / sntrup761 + X25519)
-# Classical-only KEX disabled unless ALLOW_CLASSICAL_KEX=1
-KexAlgorithms ${kex}
-HostKeyAlgorithms ${hostkeys}
-PubkeyAcceptedAlgorithms ${pubkeys}
-Ciphers ${ciphers}
-MACs ${macs}
+ssh_crypto_block() {
+  local kex_line=""
+  if [[ -n "${SSH_CRYPTO_KEX}" ]]; then
+    kex_line="KexAlgorithms ${SSH_CRYPTO_KEX}"
+  else
+    kex_line="# KexAlgorithms: vendor default (SSH_KEX_MODE=compatibility)"
+  fi
+  cat << EOF
+# SSH KEX mode: ${SSH_KEX_MODE}
+# Post-quantum hybrids: ML-KEM-768 / sntrup761 + X25519 when listed
+${kex_line}
+HostKeyAlgorithms ${SSH_CRYPTO_HOSTKEYS}
+PubkeyAcceptedAlgorithms ${SSH_CRYPTO_HOSTKEYS}
+Ciphers ${SSH_CRYPTO_CIPHERS}
+MACs ${SSH_CRYPTO_MACS}
 EOF
-)
+}
+
+ssh_unused_port() {
+  local p
+  for p in $(seq 22011 22100); do
+    if ! ss -tln 2>/dev/null | grep -qE ":${p}\\s"; then
+      echo "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ssh_kex_probe_cleanup() {
+  local pidfile="${SSH_KEX_PROBE_DIR}/sshd.pid" pid=""
+  if [[ -f "$pidfile" ]]; then
+    pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n "${SSH_KEX_PROBE_UFW_FROM:-}" && -n "${SSH_KEX_PROBE_UFW_PORT:-}" ]]; then
+    ufw delete allow from "${SSH_KEX_PROBE_UFW_FROM}" to any port "${SSH_KEX_PROBE_UFW_PORT}" proto tcp >/dev/null 2>&1 || true
+    SSH_KEX_PROBE_UFW_FROM=""
+    SSH_KEX_PROBE_UFW_PORT=""
+  fi
+  rm -rf "$SSH_KEX_PROBE_DIR"
+}
+
+ssh_probe_kex_to_host() {
+  # Return 0 if KEX negotiated (auth may fail). 1 = KEX mismatch. 2 = unreachable.
+  local host="$1" port="$2" kex="${3:-}"
+  local out opts
+  opts=(
+    -o BatchMode=yes
+    -o ConnectTimeout=8
+    -o ConnectionAttempts=1
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o GlobalKnownHostsFile=/dev/null
+    -o PreferredAuthentications=none
+    -o PubkeyAuthentication=no
+    -o PasswordAuthentication=no
+    -o NumberOfPasswordPrompts=0
+    -o IdentitiesOnly=yes
+    -o IdentityAgent=none
+    -o UpdateHostKeys=no
+    -p "$port"
+  )
+  if [[ -n "$kex" ]]; then
+    opts+=(-o "KexAlgorithms=${kex}")
+  fi
+  out="$(ssh -v "${opts[@]}" "$host" true 2>&1 || true)"
+  if printf '%s\n' "$out" | grep -qiE 'no matching key exchange method found'; then
+    return 1
+  fi
+  if printf '%s\n' "$out" | grep -qE 'kex: algorithm:'; then
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -qiE 'Permission denied|Authenticat'; then
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -qiE 'Connection refused|Connection timed out|Network is unreachable|No route to host'; then
+    return 2
+  fi
+  return 1
+}
+
+ssh_verify_listener_kex() {
+  local port="$1" kex="${2:-}"
+  local host rc ip
+  local hosts=(127.0.0.1 ::1)
+  ip="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $3}')"
+  [[ -n "$ip" ]] && hosts+=("$ip")
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [[ -n "$ip" ]] && hosts+=("$ip")
+  for host in "${hosts[@]}"; do
+    ssh_probe_kex_to_host "$host" "$port" "$kex" && return 0
+    rc=$?
+    [[ "$rc" -eq 1 ]] && return 1
+  done
+  return 2
+}
+
+ssh_start_probe_sshd() {
+  local port="$1" kex="${2:-}" allow="${3:-}" bind="${4:-}"
+  local conf="${SSH_KEX_PROBE_DIR}/sshd_config"
+  if ! [[ "$allow" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+    error "Refusing KEX probe: installer username is not a safe AllowUsers value"
+    return 1
+  fi
+  if ! ssh_valid_ip "$bind"; then
+    error "Refusing KEX probe: cannot bind to a validated session address"
+    return 1
+  fi
+  mkdir -p "$SSH_KEX_PROBE_DIR"
+  chmod 700 "$SSH_KEX_PROBE_DIR"
+  {
+    echo "Port ${port}"
+    echo "ListenAddress ${bind}"
+    echo "PidFile ${SSH_KEX_PROBE_DIR}/sshd.pid"
+    echo "HostKey /etc/ssh/ssh_host_ed25519_key"
+    [[ -f /etc/ssh/ssh_host_ecdsa_key ]] && echo "HostKey /etc/ssh/ssh_host_ecdsa_key"
+    echo "UsePAM yes"
+    echo "PubkeyAuthentication yes"
+    echo "PasswordAuthentication no"
+    echo "KbdInteractiveAuthentication no"
+    echo "AuthenticationMethods publickey"
+    if [[ "$allow" == "root" ]]; then
+      echo "PermitRootLogin prohibit-password"
+      echo "AllowUsers root"
+    else
+      echo "PermitRootLogin no"
+      echo "AllowUsers ${allow}"
+    fi
+    echo "PrintMotd no"
+    echo "PermitTTY no"
+    echo "AllowAgentForwarding no"
+    echo "AllowTcpForwarding no"
+    echo "X11Forwarding no"
+    echo "MaxStartups 2"
+    echo "MaxAuthTries 2"
+    echo "LoginGraceTime 30"
+    echo "ForceCommand /bin/echo SecurityHardening KEX probe succeeded. You can disconnect."
+    if [[ -n "$kex" ]]; then
+      echo "KexAlgorithms ${kex}"
+    fi
+    echo "HostKeyAlgorithms ${SSH_CRYPTO_HOSTKEYS}"
+    echo "PubkeyAcceptedAlgorithms ${SSH_CRYPTO_HOSTKEYS}"
+    echo "Ciphers ${SSH_CRYPTO_CIPHERS}"
+    echo "MACs ${SSH_CRYPTO_MACS}"
+  } > "$conf"
+  if ! sshd -t -f "$conf" 2>/dev/null; then
+    error "KEX probe sshd config is invalid"
+    sshd -t -f "$conf" || true
+    return 1
+  fi
+  sshd -f "$conf" -E "${SSH_KEX_PROBE_DIR}/sshd.log"
+}
+
+ssh_probe_log_accepted() {
+  local peer="$1" log="${SSH_KEX_PROBE_DIR}/sshd.log"
+  [[ -f "$log" ]] || return 1
+  grep -E 'Accepted publickey for ' "$log" | grep -Fq "from ${peer} "
+}
+
+ssh_wait_remote_kex_probe() {
+  local port timeout i user host peer bind
+  timeout="${SSH_KEX_PROBE_TIMEOUT:-120}"
+  [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=120
+  ((timeout < 30)) && timeout=30
+  ((timeout > 600)) && timeout=600
+  port="$(ssh_unused_port)" || { error "No free TCP port for KEX probe"; return 1; }
+  user="${SUDO_USER:-}"
+  [[ -z "$user" || "$user" == "root" ]] && user="$(awk '{print $1}' <<< "$(who am i 2>/dev/null || true)")"
+  user="${user:-root}"
+  if ! [[ "$user" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+    error "Cannot validate installer username for the KEX probe"
+    return 1
+  fi
+  peer="$(ssh_session_peer_ip)"
+  bind="$(ssh_session_bind_ip)"
+  if ! ssh_valid_ip "$peer" || ! ssh_valid_ip "$bind"; then
+    error "Cannot scope the KEX probe to this SSH session (need peer and bind addresses)"
+    return 1
+  fi
+  host="$bind"
+
+  trap ssh_kex_probe_cleanup EXIT
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow from "$peer" to any port "$port" proto tcp comment 'hardening-kex-probe' >/dev/null 2>&1 || true
+    SSH_KEX_PROBE_UFW_FROM="$peer"
+    SSH_KEX_PROBE_UFW_PORT="$port"
+  fi
+  ensure_ssh_host_keys
+  ssh_start_probe_sshd "$port" "$SSH_CRYPTO_KEX" "$user" "$bind" || {
+    ssh_kex_probe_cleanup
+    trap - EXIT
+    return 1
+  }
+
+  warn "pq-only will be applied only after a SECOND SSH login from this same client."
+  warn "From that client, run:"
+  warn "  ssh -p ${port} ${user}@${host}"
+  warn "Waiting up to ${timeout}s (this session stays up if the probe fails)..."
+
+  for ((i = 1; i <= timeout; i++)); do
+    if ssh_probe_log_accepted "$peer"; then
+      success "Second SSH connection verified (KEX probe)"
+      ssh_kex_probe_cleanup
+      trap - EXIT
+      return 0
+    fi
+    if ((i % 15 == 0)); then
+      info "Still waiting for probe login on port ${port} (${i}/${timeout}s)..."
+    fi
+    sleep 1
+  done
+  error "No second SSH connection on probe port ${port} within ${timeout}s"
+  ssh_kex_probe_cleanup
+  trap - EXIT
+  return 1
+}
+
+ssh_prepare_pq_only_or_fallback() {
+  if [[ "${SSH_KEX_MODE}" != "pq-only" ]]; then
+    return 0
+  fi
+  if ssh_production_is_pq_only; then
+    info "sshd is already PQ-only; skipping extra lockout probe"
+    return 0
+  fi
+  if ! ssh_is_over_ssh; then
+    warn "pq-only from console: remote clients without PQ KEX will be locked out after restart."
+    return 0
+  fi
+  if [[ "${ASSUME_YES:-0}" == "1" ]] || [[ ! -t 0 ]]; then
+    if [[ "${SSH_KEX_FORCE:-0}" == "1" ]]; then
+      warn "SSH_KEX_FORCE=1: applying pq-only over SSH without a second-session probe"
+      return 0
+    fi
+    warn "Refusing unattended pq-only over SSH without a verified second connection."
+    warn "Falling back to pq-preferred. Re-run interactively, from console, or set SSH_KEX_FORCE=1."
+    SSH_KEX_MODE=pq-preferred
+    export SSH_KEX_MODE
+    ssh_load_crypto_lists || return 1
+    return 0
+  fi
+  if ssh_wait_remote_kex_probe; then
+    return 0
+  fi
+  warn "Second SSH connection not verified; falling back to pq-preferred (classical KEX still allowed)"
+  SSH_KEX_MODE=pq-preferred
+  export SSH_KEX_MODE
+  ssh_load_crypto_lists || return 1
+}
+
+apply_ssh_post_quantum() {
+  local dropin="$1"
+  local write_client="${2:-1}"
+  local client="${SSH_CLIENT_DROPIN:-/etc/ssh/ssh_config.d/99-security-hardening.conf}"
+  local crypto tmp line client_kex classical=""
+
+  ensure_ssh_host_keys
+  ssh_load_crypto_lists || return 1
+  crypto="$(ssh_crypto_block)"
 
   tmp="$(mktemp)"
   if grep -q 'PLACEHOLDER_SSH_PQ_CRYPTO' "$dropin" 2>/dev/null; then
@@ -650,25 +1141,77 @@ EOF
       fi
     done < "$dropin" > "$tmp"
   else
-    # Refresh existing PQ / crypto lines then append
-    grep -vE '^(# Post-quantum hybrid key exchange|# Classical-only KEX|KexAlgorithms |HostKeyAlgorithms |PubkeyAcceptedAlgorithms |Ciphers |MACs )' "$dropin" > "$tmp" || true
+    grep -vE '^(# SSH KEX mode:|# Post-quantum hybrid key exchange|# Post-quantum hybrids:|# Classical-only KEX|# KexAlgorithms:|KexAlgorithms |HostKeyAlgorithms |PubkeyAcceptedAlgorithms |Ciphers |MACs )' "$dropin" > "$tmp" || true
     printf '\n%s\n' "$crypto" >> "$tmp"
   fi
   mv "$tmp" "$dropin"
 
-  mkdir -p "$(dirname "$client")"
-  cat > "$client" << EOF
-# Managed by SecurityHardening suite — post-quantum client defaults
-Host *
-    KexAlgorithms ${kex}
-    HostKeyAlgorithms ${hostkeys}
-    PubkeyAcceptedAlgorithms ${pubkeys}
-    Ciphers ${ciphers}
-    MACs ${macs}
-EOF
+  if [[ "$write_client" == "1" ]]; then
+    # Never push pq-only onto the system SSH client: that breaks git/GitHub and other non-PQ servers.
+    client_kex="${SSH_CRYPTO_KEX}"
+    if [[ "${SSH_KEX_MODE}" == "pq-only" || -z "$client_kex" ]]; then
+      client_kex="$(ssh_pq_algs)"
+      if [[ -n "$client_kex" ]]; then
+        classical="$(ssh_classical_algs)"
+        [[ -n "$classical" ]] && client_kex="${client_kex},${classical}"
+      fi
+    fi
+    mkdir -p "$(dirname "$client")"
+    {
+      echo "# Managed by SecurityHardening suite — client defaults (never PQ-only; outbound compat)"
+      echo "Host *"
+      if [[ -n "$client_kex" ]]; then
+        echo "    KexAlgorithms ${client_kex}"
+      fi
+      echo "    HostKeyAlgorithms ${SSH_CRYPTO_HOSTKEYS}"
+      echo "    PubkeyAcceptedAlgorithms ${SSH_CRYPTO_HOSTKEYS}"
+      echo "    Ciphers ${SSH_CRYPTO_CIPHERS}"
+      echo "    MACs ${SSH_CRYPTO_MACS}"
+    } > "$client"
+  fi
 
-  info "Post-quantum KEX: ${kex}"
-  success "SSH post-quantum crypto applied (server + client defaults)"
+  if [[ -n "${SSH_CRYPTO_KEX}" ]]; then
+    info "SSH server KEX (${SSH_KEX_MODE}): ${SSH_CRYPTO_KEX}"
+  else
+    info "SSH server KEX (${SSH_KEX_MODE}): vendor default"
+  fi
+  if [[ "$write_client" == "1" ]]; then
+    success "SSH crypto policy applied (server drop-in + client defaults)"
+  else
+    success "SSH crypto policy applied (server drop-in)"
+  fi
+}
+
+ssh_rollback_ssh_hardening() {
+  local dropin="$1"
+  local client="${SSH_CLIENT_DROPIN:-/etc/ssh/ssh_config.d/99-security-hardening.conf}"
+  warn "Rolling back SSH drop-in after failed connection probe"
+  if [[ -f "${dropin}.pre-hardening" ]]; then
+    mv -f "${dropin}.pre-hardening" "$dropin"
+  else
+    rm -f "$dropin"
+  fi
+  if [[ -f "${client}.pre-hardening" ]]; then
+    mv -f "${client}.pre-hardening" "$client"
+  else
+    rm -f "$client"
+  fi
+  restart_ssh || true
+}
+
+ssh_verify_or_rollback() {
+  local dropin="$1"
+  local port kex rc=0
+  port="$(current_ssh_port)"
+  kex="${SSH_CRYPTO_KEX:-}"
+  ssh_verify_listener_kex "$port" "$kex" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    success "SSH connection probe succeeded on port ${port} (KEX negotiated)"
+    return 0
+  fi
+  error "SSH connection probe failed after applying KEX mode ${SSH_KEX_MODE}"
+  ssh_rollback_ssh_hardening "$dropin"
+  return 1
 }
 
 # --- SSH auth policy (password disable only when keys exist, unless forced) ---
@@ -760,19 +1303,27 @@ EOF
 # --- SSH hardening via drop-in (safe; does not wipe vendor config) ---
 configure_ssh_hardening() {
   local dropin="/etc/ssh/sshd_config.d/99-security-hardening.conf"
+  local client="${SSH_CLIENT_DROPIN:-/etc/ssh/ssh_config.d/99-security-hardening.conf}"
 
-  if dry_skip "harden SSH (PQ KEX, auth policy, optional port)"; then return 0; fi
+  resolve_ssh_kex_mode
+
+  if dry_skip "harden SSH (KEX ${SSH_KEX_MODE}, auth policy, optional port)"; then return 0; fi
 
   if ! dpkg -s openssh-server >/dev/null 2>&1; then
     warn "openssh-server not installed; installing..."
     install_packages openssh-server
   fi
-  # Re-detect after install (Ubuntu 26 ships ssh.socket with the package)
   detect_ssh_socket_activation
 
-  log "Hardening SSH (drop-in config + post-quantum KEX)..."
+  log "Hardening SSH (drop-in config, KEX mode=${SSH_KEX_MODE})..."
   mkdir -p /etc/ssh/sshd_config.d
   backup_file /etc/ssh/sshd_config
+  [[ -f "$dropin" ]] && cp -a "$dropin" "${dropin}.pre-hardening"
+  [[ -f "$client" ]] && cp -a "$client" "${client}.pre-hardening"
+
+  ensure_ssh_host_keys
+  ssh_load_crypto_lists || return 1
+  ssh_prepare_pq_only_or_fallback || return 1
 
   if [[ -f "${CONFIG_DIR}/ssh_hardening.conf" ]]; then
     cp "${CONFIG_DIR}/ssh_hardening.conf" "$dropin"
@@ -798,18 +1349,16 @@ HostKey /etc/ssh/ssh_host_ed25519_key
 EOF
   fi
 
-  # Ensure Include is present (Debian/Ubuntu default; OpenSSH 9+/10 on Ubuntu 26)
   if [[ -f /etc/ssh/sshd_config ]] \
     && ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
     backup_file /etc/ssh/sshd_config
     sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
   fi
 
-  apply_ssh_post_quantum "$dropin" || return 1
+  apply_ssh_post_quantum "$dropin" 1 || return 1
   apply_ssh_password_policy "$dropin"
   apply_ssh_listen_port "$dropin" || return 1
 
-  # Only keep HostKey lines for keys that exist
   if [[ ! -f /etc/ssh/ssh_host_ecdsa_key ]]; then
     sed -i '\|/etc/ssh/ssh_host_ecdsa_key|d' "$dropin"
   fi
@@ -817,7 +1366,6 @@ EOF
     sed -i '\|/etc/ssh/ssh_host_rsa_key|d' "$dropin"
   fi
 
-  # If a directive is rejected by this OpenSSH build, strip and re-validate
   if ! sshd -t 2>/dev/null; then
     warn "sshd rejected drop-in; removing unknown keys and retrying"
     local bad
@@ -829,12 +1377,18 @@ EOF
     done < <(printf '%s\n' "$bad" | sed -nE 's/.*[Uu]nsupported option[= ]+([A-Za-z0-9]+).*/\1/p; s/.*Bad configuration option[=: ]+([A-Za-z0-9]+).*/\1/p')
     if ! sshd -t 2>/dev/null; then
       error "SSH hardening drop-in still invalid; leaving previous SSH config active"
-      rm -f "$dropin"
+      ssh_rollback_ssh_hardening "$dropin"
       return 1
     fi
   fi
 
-  restart_ssh
+  restart_ssh || {
+    ssh_rollback_ssh_hardening "$dropin"
+    return 1
+  }
+  ssh_verify_or_rollback "$dropin" || return 1
+  save_ssh_kex_mode
+  rm -f "${dropin}.pre-hardening" "${client}.pre-hardening"
 }
 
 # --- Password policy ---
@@ -1092,7 +1646,10 @@ for s in ufw fail2ban apparmor auditd clamav-daemon ssh.socket ssh sshd; do
   printf "%-16s %s\n" "$s" "$(systemctl is-active "$s" 2>/dev/null || echo n/a)"
 done
 echo ""
-echo "=== SSH KEX (post-quantum) ==="
+echo "=== SSH KEX ==="
+if [[ -f /etc/security/hardening-ssh-kex-mode ]]; then
+  echo "mode: $(tr -d '[:space:]' < /etc/security/hardening-ssh-kex-mode)"
+fi
 sshd -T 2>/dev/null | grep -i kexalgorithms || echo "sshd not available"
 echo ""
 echo "=== Updates ==="
@@ -1151,12 +1708,13 @@ print_next_steps() {
   echo ""
   echo "=== Hardening complete (${level}) ==="
   echo "OS: ${PRETTY_NAME:-$DISTRO_ID}"
+  echo "SSH KEX mode: ${SSH_KEX_MODE:-unknown}"
   echo "Log: $LOG_FILE"
   echo "Backups: $BACKUP_DIR"
   echo "Latest snapshot: ${BACKUP_DIR}/latest-snapshot.tar.gz"
   echo ""
   echo "Next steps:"
-  echo "  1. Keep an open console/session until you verify SSH"
+  echo "  1. Keep an open console/session until you verify SSH from a second client"
   echo "  2. Test SSH from another session: ssh -p $(current_ssh_port) user@host"
   echo "  3. Review firewall: ufw status verbose"
   echo "  4. Check fail2ban: fail2ban-client status"
